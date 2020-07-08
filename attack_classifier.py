@@ -5,8 +5,7 @@ import pytorch_lightning as pl
 from traitlets.config.loader import PyFileConfigLoader
 import torchvision
 from torch.utils.data import DataLoader, Subset
-from models import ModelWrapper, ModelWrapper2
-from distillation import StudentModelWrapper, StudentModelWrapper2
+from models import ResidualRegularizedModel, VGG16
 import argparse
 import re
 import utils
@@ -169,8 +168,8 @@ def extract_attack(args):
 
 def whitebox_attack(model, args):
     outfile = args.model_path + 'advdata_%s_eps=%f_%drestarts.pt' % (args.attack, args.eps, args.nb_restarts)
-    if os.path.exists(outfile):
-        return
+    # if os.path.exists(outfile):
+    #     return
         
     print("Using a white box attack")       
     test_loader = get_test_loader(args.dataset, batch_size=args.batch_size)   
