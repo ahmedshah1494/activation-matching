@@ -93,15 +93,25 @@ def set_grad(var):
         var.grad = grad
     return hook
 
-class ResidualRegularizedModel(nn.Module):
-    def __init__(self, cov_update_alpha = 0.75):    
+class LayeredModel(nn.Module):
+    def __init__(self):
+        super(LayeredModel, self).__init__()
+        self.layers = []
+
+class ResidualRegularizedModel(LayeredModel):
+    def __init__(self, args):    
         super(ResidualRegularizedModel, self).__init__()
         self.layers = []
         self.cov = []
-        self.cov_update_alpha = cov_update_alpha
+        self.args = args
+        self.cov_update_alpha = args.cov_update_alpha
+        self.mask_layers = []
 
     def reset(self):
         self.cov = []
+
+    def init_mask(self):
+        pass
 
     def forward(self, x, compute_residuals=False, store_intermediate=False):
         residuals = []
@@ -130,17 +140,25 @@ class ResidualRegularizedModel(nn.Module):
                         else:
                             self.cov[i] = (1-self.cov_update_alpha)*self.cov[i].detach() + self.cov_update_alpha*S
                         S = self.cov[i]
+                    else:
+                        S = (1-self.cov_update_alpha)*self.cov[i].detach() + self.cov_update_alpha*S
                     A = compute_A(S, z.shape[0])  
                     # assert (torch.diag(A) == 0).all()
 
                     r = torch.mm(z, A.transpose(0,1)) - z
+
+                    if self.args.mask_low_residual:
+                        diff = (r-self.mask_layers[i]).mean(0,keepdim=True)
+                        p = diff / diff.sum()
+                        mask = torch.bernoulli(p)
+                        z = z*mask
+
                     r = r.reshape(*z_shape)
                     r = r.permute(*z_dim_order).contiguous()                
                     residuals.append(r) 
 
                     z = z.reshape(*z_shape)
-                    z = z.permute(*z_dim_order).contiguous()
-        
+                    z = z.permute(*z_dim_order).contiguous()                    
         if compute_residuals:
             if store_intermediate:                
                 return z, residuals, Z
@@ -149,9 +167,9 @@ class ResidualRegularizedModel(nn.Module):
         else:
             return z
 
-class VGG16(ResidualRegularizedModel):
-    def __init__(self, num_classes):
-        super(VGG16, self).__init__()
+class VGG16(LayeredModel):
+    def __init__(self, args, num_classes):
+        super(VGG16, self).__init__(args)
         self.name = 'VGG16'
 
         self.layers = nn.ModuleList([
@@ -174,7 +192,14 @@ class VGG16(ResidualRegularizedModel):
             ),
             nn.Linear(512, num_classes),
         ])
+
+        if args.mask_low_residual:
+            self.mask_layers = nn.ParameterList(self.init_mask())
     
+    def init_mask(self):
+        output_sizes = [64,64,64,128,128,256,256,512,512,512,512,512]        
+        mask_layers = [nn.Parameter(torch.rand(s)) for s in output_sizes]
+        return mask_layers
     def conv_bn_act(self, in_channels, out_channels, kernel_size, padding):
         module = nn.Sequential(
             nn.Conv2d(in_channels,out_channels, kernel_size=kernel_size, padding=padding),
