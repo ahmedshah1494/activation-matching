@@ -29,7 +29,7 @@ class ResidualRegularizedTrainer(Trainer):
         x,y = batch        
         x = x.to(self.device)
         y = y.to(self.device)
-        if args.scale_residual_by_grad:
+        if self.args.scale_residual_by_grad:
             logits, residuals, Z = self.model(x, compute_residuals=True, store_intermediate=True)
         else:
             logits, residuals = self.model(x, compute_residuals=True)
@@ -40,7 +40,7 @@ class ResidualRegularizedTrainer(Trainer):
 
         total_residual_grad = 0
         total_residual_norm = 0
-        if args.scale_residual_by_grad:
+        if self.args.scale_residual_by_grad:
             self.optimizer.zero_grad()
             loss.mean().backward(create_graph=True)
             weights = 2**np.linspace(-5, 5, len(Z))
@@ -53,7 +53,7 @@ class ResidualRegularizedTrainer(Trainer):
                         r_ = r_.sum(1)
                     total_residual_grad += r_.sum(1)
                     total_residual_norm += torch.norm(r_, dim=1)
-            loss += args.regularization_weight*total_residual_grad
+            loss += self.args.regularization_weight*total_residual_grad
         else:                   
             for r in residuals:
                 if len(r.shape) == 4:
@@ -61,7 +61,7 @@ class ResidualRegularizedTrainer(Trainer):
                     r = r.reshape(r.shape[0], -1, r.shape[3])
                     r = r.sum(1)
                 total_residual_norm += torch.norm(r, dim=1)
-            loss -= args.regularization_weight*total_residual_norm
+            loss -= self.args.regularization_weight*total_residual_norm
         loss = loss.mean()
         total_residual_grad = float(total_residual_grad.detach().cpu().mean()) if isinstance(total_residual_grad, torch.Tensor) else total_residual_grad
         total_residual_norm = float(total_residual_norm.detach().cpu().mean()) if isinstance(total_residual_norm, torch.Tensor) else total_residual_norm
@@ -73,19 +73,19 @@ class ResidualRegularizedTrainer(Trainer):
                              'train_residual_norm': total_residual_norm
                              }
     
-    def val_step(self, batch, batch_idx):
-        x,y = batch        
-        x = x.to(self.device)
-        y = y.to(self.device)        
-        logits = self.model(x, compute_residuals=False)
-        loss = self.criterion(logits, y)
-        acc, correct = compute_accuracy(logits.detach().cpu(), y.detach().cpu())                
-        loss = loss.mean().detach().cpu()
+    # def val_step(self, batch, batch_idx):
+    #     x,y = batch        
+    #     x = x.to(self.device)
+    #     y = y.to(self.device)        
+    #     logits = self.model(x, compute_residuals=False)
+    #     loss = self.criterion(logits, y)
+    #     acc, correct = compute_accuracy(logits.detach().cpu(), y.detach().cpu())                
+    #     loss = loss.mean().detach().cpu()
 
-        return {'loss':loss}, {
-                             'val_accuracy': acc,
-                             'val_loss': float(loss.detach().cpu())
-                             }
+    #     return {'loss':loss}, {
+    #                          'val_accuracy': acc,
+    #                          'val_loss': float(loss.detach().cpu())
+    #                          }
     def test_step(self, batch, batch_idx):
         x,y = batch        
         x = x.to(self.device)
@@ -98,7 +98,7 @@ class ResidualRegularizedTrainer(Trainer):
         return {'loss':loss}, {
                              'test_accuracy': acc,
                              'test_loss': float(loss.detach().cpu())
-                             }
+                            }
     def epoch_end(self, epoch_idx, train_outputs, val_outputs, train_metrics, val_metrics):
         self.model.reset()
         return super().epoch_end(epoch_idx, train_outputs, val_outputs, train_metrics, val_metrics)
@@ -168,7 +168,7 @@ def train(args):
 
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-    model = VGG16(num_classes).to(device)
+    model = VGG16(args, num_classes).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=0)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=args.patience, verbose=True, factor=0.5)
 
@@ -218,6 +218,7 @@ if __name__ == '__main__':
     parser.add_argument('--regularization_weight', type=float, default=1e-4)
     parser.add_argument('--scale_residual_by_grad', action='store_true')
     parser.add_argument('--test', action='store_true')
+    parser.add_argument('--mask_low_residual', action='store_true')
     args = parser.parse_args()
 
     if args.test:
