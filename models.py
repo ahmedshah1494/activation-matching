@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 from torch.utils.data import TensorDataset, DataLoader, Dataset
+from wide_resnet import Wide_ResNet
 import numpy as np
 import utils
 import sys
@@ -94,16 +95,28 @@ def set_grad(var):
     return hook
 
 class LayeredModel(nn.Module):
-    def __init__(self):
+    def __init__(self, args):
         super(LayeredModel, self).__init__()
         self.layers = []
+        self.args = args
+    def forward(self, x, store_intermediate=False):
+        Z = []
+
+        z = x
+        for i,l in enumerate(self.layers):
+            z = l(z)
+            if store_intermediate:
+                Z.append(z)
+        if store_intermediate:
+            return z, Z
+        else:
+            return z
 
 class ResidualRegularizedModel(LayeredModel):
-    def __init__(self, args):    
+    def __init__(self, args, *args_, **kwargs):    
         super(ResidualRegularizedModel, self).__init__()
         self.layers = []
-        self.cov = []
-        self.args = args
+        self.cov = []        
         self.cov_update_alpha = args.cov_update_alpha
         self.mask_layers = []
 
@@ -216,6 +229,28 @@ class VGG16(LayeredModel):
             nn.MaxPool2d(kernel_size=pooling_kernel_size, stride=pooling_stride),
         )
         return module
+
+class WideResnet(LayeredModel):
+    def __init__(self, args, depth, widen_factor, dropout_rate, num_classes):
+        super(WideResnet, self).__init__(args)
+        self.name = 'WideResNet'
+        self.model = Wide_ResNet(depth, widen_factor, dropout_rate, num_classes)
+        self.layers = [
+            self.model.conv1,
+            self.model.layer1,
+            self.model.layer2,            
+            nn.Sequential(
+                self.model.layer3,
+                self.model.bn1,
+                nn.ReLU(),
+                nn.AdaptiveAvgPool2d((1,1)),
+                Flatten(),
+            ),
+            self.model.linear,
+        ]
+    
+    def forward(self, x, store_intermediate=False):
+        return super().forward(x, store_intermediate=store_intermediate)
 
 if __name__ == '__main__':
     model = VGG16(10).cuda()
