@@ -2,6 +2,8 @@ import torch
 from torch import nn
 from torch.utils.data import TensorDataset, DataLoader, Dataset
 from wide_resnet import Wide_ResNet
+from advertorch.utils import batch_per_image_standardization
+from advertorch_examples.models import WideResNet
 import numpy as np
 import utils
 import sys
@@ -99,18 +101,35 @@ class LayeredModel(nn.Module):
         super(LayeredModel, self).__init__()
         self.layers = []
         self.args = args
+
+    def get_layer_output_sizes(self):
+        pass
+
     def forward(self, x, store_intermediate=False):
         Z = []
-
+        if hasattr(self.args, 'normalize_input') and self.args.normalize_input:
+            x = batch_per_image_standardization(x)
         z = x
         for i,l in enumerate(self.layers):
             z = l(z)
-            if store_intermediate:
-                Z.append(z)
+            if store_intermediate and i < len(self.layers)-1:
+                if hasattr(self.args, 'layer_idxs') and (i in self.args.layer_idxs or len(self.args.layer_idxs)==0):
+                    Z.append(z)
         if store_intermediate:
             return z, Z
         else:
             return z
+
+class GaussianNoiseLayer(nn.Module):
+    def __init__(self, mean=0., std=0.):
+        super(GaussianNoiseLayer, self).__init__()
+        self.mean = mean
+        self.std = std
+
+    def forward(self, x):
+        zeros = torch.zeros(x.shape, device=x.device)
+        noise = torch.normal(zeros+self.mean, zeros+self.std).to(x.device)        
+        return x + noise
 
 class ResidualRegularizedModel(LayeredModel):
     def __init__(self, args, *args_, **kwargs):    
@@ -233,7 +252,7 @@ class VGG16(LayeredModel):
 class WideResnet(LayeredModel):
     def __init__(self, args, depth, widen_factor, dropout_rate, num_classes):
         super(WideResnet, self).__init__(args)
-        self.name = 'WideResNet'
+        self.name = 'WideResNet_%d_%d' % (depth, widen_factor)
         self.model = Wide_ResNet(depth, widen_factor, dropout_rate, num_classes)
         self.layers = [
             self.model.conv1,
@@ -248,7 +267,11 @@ class WideResnet(LayeredModel):
             ),
             self.model.linear,
         ]
+        self.layer_output_sizes = [16, 16*widen_factor, 32*widen_factor, 64*widen_factor, num_classes]
     
+    def get_layer_output_sizes(self):
+        return self.layer_output_sizes
+
     def forward(self, x, store_intermediate=False):
         return super().forward(x, store_intermediate=store_intermediate)
 
