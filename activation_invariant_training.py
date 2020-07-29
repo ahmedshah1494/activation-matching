@@ -29,8 +29,8 @@ class ActivationInvarianceTrainer(Trainer):
         z_diff = []
         for i, (z, zadv) in enumerate(zip(interm_Z, interm_Zadv)):            
             _z_diff = z-zadv
-            z_diff.append(_z_diff.view(z.shape[0], -1).mean(0))
-        z_diff = torch.cat(z_diff, dim=0)
+            z_diff.append(_z_diff.view(z.shape[0], -1))
+        z_diff = torch.cat(z_diff, dim=1)
         return logits, adv_logits, z_diff
 
     def train_step(self, batch, batch_idx):
@@ -45,14 +45,15 @@ class ActivationInvarianceTrainer(Trainer):
         adv_classification_loss = torch.nn.functional.cross_entropy(adv_logits, y)
         
         loss = cln_classification_loss + self.args.adv_loss_wt*adv_classification_loss
-
-        z_loss = torch.norm(z_diff, p=2)**2
+        z_diff_norm = torch.norm(z_diff, p=2, dim=1)**2
         if self.args.optimizer == 'MoM' and self.model.training:
             if isinstance(self.optimizer.L, int):
-                self.optimizer.L = torch.zeros(z_diff.shape, device=z_diff.device) + self.optimizer.L
-            loss += self.optimizer.L.dot(z_diff) + (self.optimizer.c * z_loss)/2
+                self.optimizer.L = torch.zeros((z_diff.shape[1],1), device=z_diff.device) + self.optimizer.L
+            # print(z_diff.shape, self.optimizer.L.shape, z_diff_norm.shape)
+            z_term = z_diff.mm(self.optimizer.L).squeeze() + (self.optimizer.c * z_diff_norm)/2            
         else:
-            loss += self.args.z_wt*z_loss
+            z_term = self.args.z_wt*(z_diff_norm)
+        loss += z_term.mean()
 
         cln_acc, _ = compute_accuracy(logits.detach().cpu(), y.detach().cpu())
         adv_acc, _ = compute_accuracy(adv_logits.detach().cpu(), y.detach().cpu())
@@ -63,13 +64,13 @@ class ActivationInvarianceTrainer(Trainer):
             self.optimizer.step()
             with torch.no_grad():
                 _, _, z_diff = self.compute_outputs(x, xadv)
-                self.optimizer.L += self.optimizer.c * z_diff
-            self.optimizer.c *= 1.0005
+                self.optimizer.L += self.optimizer.c * z_diff.mean(0).unsqueeze(1)
+            self.optimizer.c *= self.args.c_step_size
             loss.detach()
         return {'loss':loss}, {'train_clean_accuracy': cln_acc,
                              'train_adv_accuracy': adv_acc,
                              'train_loss': float(loss.detach().cpu()),
-                             'train_Z_loss': float(z_loss.detach().cpu())}
+                             'train_Z_loss': float(z_diff_norm.max().detach().cpu())}
 
     def _optimization_wrapper(self, func):        
         if self.args.optimizer == 'MoM':
@@ -218,7 +219,8 @@ def train(args):
 
     model_dict = {
         'vgg16': lambda : VGG16(args, num_classes),
-        'wide_resnet': lambda : WideResnet(args, 28, 4, 0, num_classes)
+        'wide_resnet': lambda : WideResnet(args, 28, 4, 0, num_classes),
+        'wide_resnet-10': lambda : WideResnet(args, 28, 10, 0, num_classes)
     }
     model = model_dict[args.model_name]().to(device)
     if args.optimizer == 'adam':
@@ -289,6 +291,7 @@ if __name__ == '__main__':
     parser.add_argument('--optimizer', type=str, default='adam')
     parser.add_argument('--decay_factor', type=float, default=0.5)
     parser.add_argument('--init_c', type=float, default=1)
+    parser.add_argument('--c_step_size', type=float, default=1.0005)
     
     parser.add_argument('--test', action='store_true')
 
