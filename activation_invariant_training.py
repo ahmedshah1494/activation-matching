@@ -38,22 +38,7 @@ class ActivationInvarianceTrainer(Trainer):
         x = x.to(self.device)
         y = y.to(self.device)
 
-        xadv = self.adversary.perturb(x, y)        
-        # logits, interm_Z = self.model(x, store_intermediate=True)        
-        # adv_logits, interm_Zadv = self.model(xadv, store_intermediate=True)
-        # if self.args.detach_adv_logits:
-        #     C = self.model.layers[-2].requires_grad_(False)
-        #     adv_logits = C(interm_Zadv[-1])
-        #     C.requires_grad_(True)
-        
-        # if self.args.regress_on_logits:
-        #     interm_Z.append(logits)
-        #     interm_Zadv.append(adv_logits)
-        
-        # z_loss = 0
-        # for i, (z, zadv) in enumerate(zip(interm_Z, interm_Zadv)):            
-        #     _z_loss = torch.nn.functional.mse_loss(z, zadv, reduction='none')
-        #     z_loss += _z_loss.view(z.shape[0], -1).sum(1).mean()
+        xadv = self.adversary.perturb(x, y)
         logits, adv_logits, z_diff = self.compute_outputs(x, xadv)
 
         cln_classification_loss = torch.nn.functional.cross_entropy(logits, y)
@@ -80,7 +65,7 @@ class ActivationInvarianceTrainer(Trainer):
                 _, _, z_diff = self.compute_outputs(x, xadv)
                 self.optimizer.L += self.optimizer.c * z_diff
             self.optimizer.c *= 1.0005
-        loss.detach()
+            loss.detach()
         return {'loss':loss}, {'train_clean_accuracy': cln_acc,
                              'train_adv_accuracy': adv_acc,
                              'train_loss': float(loss.detach().cpu()),
