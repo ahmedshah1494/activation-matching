@@ -111,7 +111,14 @@ class LayeredModel(nn.Module):
             x = batch_per_image_standardization(x)
         z = x
         for i,l in enumerate(self.layers):
-            z = l(z)
+            _z = l(z)
+            if hasattr(self.args, 'normalize_activations') and self.args.normalize_activations:
+                z_shape = _z.shape
+                _z = _z.view(z_shape[0], -1)
+                z_normed = _z/torch.norm(_z, p=2, dim=1, keepdim=True)
+                z = z_normed.view(*z_shape)
+            else:
+                z = _z
             if store_intermediate and i < len(self.layers)-1:
                 if hasattr(self.args, 'layer_idxs') and (i in self.args.layer_idxs or len(self.args.layer_idxs)==0):
                     Z.append(z)
@@ -224,9 +231,6 @@ class VGG16(LayeredModel):
             ),
             nn.Linear(512, num_classes),
         ])
-
-        if args.mask_low_residual:
-            self.mask_layers = nn.ParameterList(self.init_mask())
     
     def init_mask(self):
         output_sizes = [64,64,64,128,128,256,256,512,512,512,512,512]        

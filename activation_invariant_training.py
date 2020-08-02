@@ -6,6 +6,7 @@ import torchvision
 from trainer import Trainer, compute_accuracy
 from attack_classifier import extract_attack
 from models import LayeredModel, VGG16, WideResnet, GaussianNoiseLayer
+from copy import deepcopy
 import argparse
 import os
 
@@ -15,9 +16,11 @@ class ActivationInvarianceTrainer(Trainer):
         attack_class, kwargs = extract_attack(args)
         self.adversary = attack_class(self.model, **kwargs)
 
-    def compute_outputs(self, x, xadv):
-        logits, interm_Z = self.model(x, store_intermediate=True)        
-        adv_logits, interm_Zadv = self.model(xadv, store_intermediate=True)        
+    def compute_outputs(self, x, xadv, model=None):
+        if model is None:
+            model = self.model
+        logits, interm_Z = model(x, store_intermediate=True)        
+        adv_logits, interm_Zadv = model(xadv, store_intermediate=True)        
         if self.args.detach_adv_logits:
             C = self.model.layers[-2].requires_grad_(False)
             adv_logits = C(interm_Zadv[-1])
@@ -27,10 +30,15 @@ class ActivationInvarianceTrainer(Trainer):
             interm_Z.append(logits)
             interm_Zadv.append(adv_logits)
         z_diff = []
-        for i, (z, zadv) in enumerate(zip(interm_Z, interm_Zadv)):            
-            _z_diff = z-zadv
+        for i, (z, zadv) in enumerate(zip(interm_Z, interm_Zadv)):           
+            if self.args.z_criterion == 'diff':
+                _z_diff = z-zadv
+            elif self.args.z_criterion == 'cosine':
+                z = z.view(z.shape[0], -1)
+                zadv = zadv.view(z.shape[0], -1)
+                _z_diff = 1 - nn.functional.cosine_similarity(z, zadv, dim=1)
             z_diff.append(_z_diff.view(z.shape[0], -1))
-        z_diff = torch.cat(z_diff, dim=1)
+        z_diff = torch.cat(z_diff, dim=1)        
         return logits, adv_logits, z_diff
 
     def train_step(self, batch, batch_idx):
@@ -49,10 +57,9 @@ class ActivationInvarianceTrainer(Trainer):
         if self.args.optimizer == 'MoM' and self.model.training:
             if isinstance(self.optimizer.L, int):
                 self.optimizer.L = torch.zeros((z_diff.shape[1],1), device=z_diff.device) + self.optimizer.L
-            # print(z_diff.shape, self.optimizer.L.shape, z_diff_norm.shape)
             z_term = z_diff.mm(self.optimizer.L).squeeze() + (self.optimizer.c * z_diff_norm)/2            
         else:
-            z_term = self.args.z_wt*(z_diff_norm)
+            z_term = self.args.z_wt*(z_diff_norm) if self.args.z_wt > 0 else torch.tensor(0.)
         loss += z_term.mean()
 
         cln_acc, _ = compute_accuracy(logits.detach().cpu(), y.detach().cpu())
@@ -72,11 +79,49 @@ class ActivationInvarianceTrainer(Trainer):
                              'train_loss': float(loss.detach().cpu()),
                              'train_Z_loss': float(z_diff_norm.max().detach().cpu())}
 
+    def admm_training_step(self, batch, batch_idx):
+        if hasattr(self, 'model2'):
+            self.model = self.model.cpu()
+            self.model2 = deepcopy(self.model).to(self.device)
+            self.model = self.model.to(self.device)
+
+        def model1_loss(x, y, logits, adv_logits, z_diff):
+            cln_classification_loss = torch.nn.functional.cross_entropy(logits, y)
+            adv_classification_loss = torch.nn.functional.cross_entropy(adv_logits, y)
+
+            loss = cln_classification_loss + self.args.adv_loss_wt*adv_classification_loss
+            return loss
+        
+        def model2_loss(x, y, logits, adv_logits, z_diff):
+            loss = torch.norm(z_diff, p=2, dim=1).sum()
+            return loss
+
+        def constraint():
+            param_diff = 0
+            for p1,p2 in (self.model1.parameters(),self.model2.parameters):
+                param_diff = ((p1-p2)**2).sum()
+            return 
+
+        x,y = batch
+        x = x.to(self.device)
+        y = y.to(self.device)
+
+        xadv = self.adversary.perturb(x, y)
+
+        logits, adv_logits, z_diff = self.compute_outputs(x, xadv)
+        loss = model1_loss(x, y, logits, adv_logits, z_diff)
     def _optimization_wrapper(self, func):        
         if self.args.optimizer == 'MoM':
             return func
         else:
-            return super(ActivationInvarianceTrainer, self)._optimization_wrapper(func)
+            def wrapper(*args, **kwargs):
+                self.optimizer.zero_grad()
+                output, logs = func(*args, **kwargs)
+                output['loss'].backward()
+                nn.utils.clip_grad_norm_(self.model.parameters(), 5)
+                self.optimizer.step()
+                return output, logs
+            return wrapper
 
     # def admm_train_step(self, batch, batch_idx):
         x,y = batch
@@ -307,9 +352,11 @@ if __name__ == '__main__':
     parser.add_argument('--adv_loss_wt', type=float, default=1)
     parser.add_argument('--detach_adv_logits', action='store_true')
     parser.add_argument('--layer_idxs', type=int, nargs='+', default=[])
+    parser.add_argument('--z_criterion', type=str, default='diff')
 
     parser.add_argument('--gaussian_smoothing', action='store_true')
     parser.add_argument('--regress_on_logits', action='store_true')
+    parser.add_argument('--normalize_activations', action='store_true')
 
     args = parser.parse_args()
     args.layer_idxs = torch.tensor(args.layer_idxs)
