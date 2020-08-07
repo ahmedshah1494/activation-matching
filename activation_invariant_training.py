@@ -49,33 +49,46 @@ class ActivationInvarianceTrainer(Trainer):
         xadv = self.adversary.perturb(x, y)
         logits, adv_logits, z_diff = self.compute_outputs(x, xadv)
 
-        cln_classification_loss = torch.nn.functional.cross_entropy(logits, y)
-        adv_classification_loss = torch.nn.functional.cross_entropy(adv_logits, y)
+        cln_acc, _ = compute_accuracy(logits, y)
+        adv_acc, _ = compute_accuracy(adv_logits, y)
+
+        if self.model.training:
+            selected_adv = np.random.binomial(1, p=self.args.adv_ratio, size=len(logits)).astype(bool)
+            while selected_adv.all() or (not selected_adv.any()):
+                selected_adv = np.random.binomial(1, p=self.args.adv_ratio, size=len(logits)).astype(bool)
+            selected_cln = (~ selected_adv)
+        else:
+            selected_adv = selected_cln = np.ones((len(logits,))).astype(bool)
+            
+        logits = logits[selected_cln]
+        adv_logits = adv_logits[selected_adv]
+        cln_classification_loss = torch.nn.functional.cross_entropy(logits, y[selected_cln])
+        adv_classification_loss = torch.nn.functional.cross_entropy(adv_logits, y[selected_adv])
         
         loss = cln_classification_loss + self.args.adv_loss_wt*adv_classification_loss
         z_diff_norm = torch.norm(z_diff, p=2, dim=1)**2
-        if self.args.optimizer == 'MoM' and self.model.training:
-            if isinstance(self.optimizer.L, int):
-                self.optimizer.L = torch.zeros((z_diff.shape[1],1), device=z_diff.device) + self.optimizer.L
-            z_term = z_diff.mm(self.optimizer.L).squeeze() + (self.optimizer.c * z_diff_norm)/2            
-        else:
-            z_term = self.args.z_wt*(z_diff_norm) if self.args.z_wt > 0 else torch.tensor(0.)
-        loss += z_term.mean()
+        if self.args.z_wt > 0:
+            if self.model.training and self.args.use_MoM:
+                if isinstance(self.optimizer.L, int):
+                    self.optimizer.L = torch.zeros((z_diff.shape[1],1), device=z_diff.device) + self.optimizer.L
+                z_term = z_diff.mm(self.optimizer.L).squeeze() + (self.optimizer.c * z_diff_norm)/2            
+            else:
+                z_term = self.args.z_wt*(z_diff_norm)
+            loss += z_term.mean()
 
-        cln_acc, _ = compute_accuracy(logits.detach().cpu(), y.detach().cpu())
-        adv_acc, _ = compute_accuracy(adv_logits.detach().cpu(), y.detach().cpu())
-
-        if self.args.optimizer == 'MoM' and self.model.training:
+        if self.model.training and self.args.use_MoM:
             self.optimizer.zero_grad()
             loss.backward()
+            nn.utils.clip_grad_norm_(self.model.parameters(), 5)
             self.optimizer.step()
             with torch.no_grad():
                 _, _, z_diff = self.compute_outputs(x, xadv)
                 self.optimizer.L += self.optimizer.c * z_diff.mean(0).unsqueeze(1)
             self.optimizer.c *= self.args.c_step_size
-            loss.detach()
+            loss.detach()            
         return {'loss':loss}, {'train_clean_accuracy': cln_acc,
                              'train_adv_accuracy': adv_acc,
+                             'train_accuracy': (cln_acc + adv_acc) / 2,
                              'train_loss': float(loss.detach().cpu()),
                              'train_Z_loss': float(z_diff_norm.max().detach().cpu())}
 
@@ -111,7 +124,7 @@ class ActivationInvarianceTrainer(Trainer):
         logits, adv_logits, z_diff = self.compute_outputs(x, xadv)
         loss = model1_loss(x, y, logits, adv_logits, z_diff)
     def _optimization_wrapper(self, func):        
-        if self.args.optimizer == 'MoM':
+        if self.args.use_MoM:
             return func
         else:
             def wrapper(*args, **kwargs):
@@ -246,13 +259,17 @@ def add_gaussian_smoothing_layers(model:LayeredModel):
             l
         )
 
-class MoM(torch.optim.Adam):
-    def __init__(self, model, init_c, h, lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=0, amsgrad=False):
+class AdamMoM(torch.optim.Adam):
+    def __init__(self, model, init_c, lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=0, amsgrad=False):
         super().__init__(model.parameters(), lr, betas, eps, weight_decay, amsgrad)
-        self.c = init_c
-        self.h = h
+        self.c = init_c        
         self.L = 0       
 
+class SGDMoM(torch.optim.SGD):
+    def __init__(self, model, init_c, lr, momentum=0, dampening=0, weight_decay=0, nesterov=False):
+        super().__init__(model.parameters(), lr, momentum, dampening, weight_decay, nesterov)
+        self.c = init_c
+        self.L = 0
 def train(args):
     train_dataset, val_dataset, test_dataset, num_classes = get_cifar10_dataset(args.datafolder)
     # train_dataset = [train_dataset[i] for i in range(10000)]
@@ -272,11 +289,14 @@ def train(args):
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=0.0005)
     elif args.optimizer == 'sgd':
         optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, weight_decay=0.0005, momentum=0.9, nesterov=True)
-    elif args.optimizer == 'MoM':
-        optimizer = MoM(model, args.init_c, ActivationInvarianceTrainer.compute_outputs, lr=args.lr, weight_decay=0.0005)
+    elif args.optimizer == 'MoM-Adam':
+        optimizer = AdamMoM(model, args.init_c, lr=args.lr, weight_decay=0.0005)        
+    elif args.optimizer == 'MoM-SGD':
+        optimizer = SGDMoM(model, args.init_c, lr=args.lr, weight_decay=0.0005, momentum=0.9, nesterov=True)
+    args.use_MoM = 'MoM' in args.optimizer
 
     args.logdir = os.path.join(args.logdir, "%s_%s" % (model.name, args.exp_name))
-    exp_num = len(os.listdir(args.logdir)) if os.path.exists(args.logdir) else 0
+    exp_num = max([int(x.split('_')[1]) for x in os.listdir(args.logdir)]) if (os.path.exists(args.logdir) and len(os.listdir(args.logdir)) > 0) else 0
     args.logdir = os.path.join(args.logdir, 'exp_%d' % exp_num)
     print('logging to ', args.logdir)
 
@@ -287,7 +307,7 @@ def train(args):
     else:
         trainer_class = ActivationInvarianceTrainer
         mode = 'max'
-        metric = 'val_adv_accuracy'
+        metric = 'val_accuracy'
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode=mode, patience=args.patience, verbose=True, factor=args.decay_factor)
 
     trainer = trainer_class(model, train_loader, val_loader, test_loader, optimizer, scheduler, device, args)
@@ -303,11 +323,13 @@ def test(args):
     
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     model = torch.load(args.model_path)
-    model = model.to(args.device)
+    model = model.to(device)
 
     args.logdir = os.path.join(*([x for x in os.path.dirname(args.model_path).split('/') if x != 'checkpoints']))
     print(args.logdir)
-    trainer = ActivationInvarianceTrainer(model, None, None, test_loader, None, None, device, args)        
+    
+    trainer = ActivationInvarianceTrainer(model, None, None, test_loader, None, None, device, args)
+    trainer.track_metric('train_accuracy', 'max')
     trainer.test()
     trainer.logger.flush()
     trainer.logger.close()
@@ -325,7 +347,7 @@ if __name__ == '__main__':
     parser.add_argument('--model_path', default='')
     parser.add_argument('--normalize_input', action='store_true')
 
-    parser.add_argument('--logdir', default='logs/activation_invariance/')
+    parser.add_argument('--logdir', default='new_logs/activation_invariance/')
     parser.add_argument('--exp_name', default='')
     
     parser.add_argument('--nepochs', type=int, default=100)
@@ -340,21 +362,22 @@ if __name__ == '__main__':
     
     parser.add_argument('--test', action='store_true')
 
-    parser.add_argument('--attack', type=str, default="none", choices=('none', 'pgdinf', 'pgdl2'))
+    parser.add_argument('--attack', type=str, default="none", choices=('none', 'pgdinf', 'pgdl2', 'gs'))
     parser.add_argument('--max_instances', type=int, default=-1)
     parser.add_argument('--nb_iter', type=int, default=7)
     parser.add_argument('--nb_restarts', type=int, default=1)
     parser.add_argument('--eps', type=float, default=8/255)
     parser.add_argument('--eps_iter', type=float, default=8/(255*4))
     parser.add_argument('--max_iters', type=int, default=7)
+    parser.add_argument('--std', type=float, default=0.25)
 
     parser.add_argument('--z_wt', type=float, default=1e-3)
     parser.add_argument('--adv_loss_wt', type=float, default=1)
+    parser.add_argument('--adv_ratio', type=float, default=1.)
     parser.add_argument('--detach_adv_logits', action='store_true')
     parser.add_argument('--layer_idxs', type=int, nargs='+', default=[])
     parser.add_argument('--z_criterion', type=str, default='diff')
 
-    parser.add_argument('--gaussian_smoothing', action='store_true')
     parser.add_argument('--regress_on_logits', action='store_true')
     parser.add_argument('--normalize_activations', action='store_true')
 
