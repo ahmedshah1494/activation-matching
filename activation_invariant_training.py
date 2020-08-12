@@ -8,6 +8,7 @@ from attack_classifier import extract_attack
 from models import LayeredModel, VGG16, WideResnet, GaussianNoiseLayer
 from copy import deepcopy
 import argparse
+from utils import get_cifar10_dataset
 import os
 
 class ActivationInvarianceTrainer(Trainer):
@@ -16,7 +17,7 @@ class ActivationInvarianceTrainer(Trainer):
         attack_class, kwargs = extract_attack(args)
         self.adversary = attack_class(self.model, **kwargs)
 
-    def compute_outputs(self, x, xadv, model=None):
+    def compute_outputs(self, x, xadv, y, model=None):
         if model is None:
             model = self.model
         logits, interm_Z = model(x, store_intermediate=True)        
@@ -25,21 +26,41 @@ class ActivationInvarianceTrainer(Trainer):
             C = self.model.layers[-2].requires_grad_(False)
             adv_logits = C(interm_Zadv[-1])
             C.requires_grad_(True)
-        
-        if self.args.regress_on_logits:
-            interm_Z.append(logits)
-            interm_Zadv.append(adv_logits)
-        z_diff = []
+
+        y_ = (y + 1).unsqueeze(1).float()
+        label_mask = ((y_.mm(1/y_.transpose(0,1))) != 1).float()
+        label_mask[label_mask == 0] = -1
+        # label_mask = torch.triu(label_mask, 1)
+
+        zzadv_diff = []
+        zz_diff = []
         for i, (z, zadv) in enumerate(zip(interm_Z, interm_Zadv)):           
             if self.args.z_criterion == 'diff':
                 _z_diff = z-zadv
+                zzadv_diff.append(_z_diff.view(z.shape[0], -1))
             elif self.args.z_criterion == 'cosine':
                 z = z.view(z.shape[0], -1)
                 zadv = zadv.view(z.shape[0], -1)
                 _z_diff = 1 - nn.functional.cosine_similarity(z, zadv, dim=1)
-            z_diff.append(_z_diff.view(z.shape[0], -1))
-        z_diff = torch.cat(z_diff, dim=1)        
-        return logits, adv_logits, z_diff
+                zzadv_diff.append(_z_diff.view(z.shape[0], -1))
+            elif self.args.z_criterion == 'cosine-spread':
+                z = z.view(z.shape[0], -1)
+                zadv = zadv.view(z.shape[0], -1)
+
+                normed_z = z / torch.norm(z, p=2, dim=1, keepdim=True)
+                normed_zadv = zadv / torch.norm(zadv, p=2, dim=1, keepdim=True)
+                
+                zz_cos = z.mm(z.transpose(0,1)) * label_mask                
+                zz_cos[label_mask == -1] += 1
+                zz_cos = torch.abs(zz_cos)                
+                zz_cos = (zz_cos).sum(1, keepdim=True) / ((label_mask != 0).float().sum(1, keepdim=True)*2)
+                zzadv_cos = 1 - nn.functional.cosine_similarity(z, zadv, dim=1).unsqueeze(1)                
+                zz_diff.append(zz_cos)
+                zzadv_diff.append(zzadv_cos)
+        if len(zz_diff) > 0:
+            zz_diff = torch.cat(zz_diff, dim=1)
+        zzadv_diff = torch.cat(zzadv_diff, dim=1)
+        return logits, adv_logits, zzadv_diff, zz_diff
 
     def train_step(self, batch, batch_idx):
         x,y = batch
@@ -47,7 +68,7 @@ class ActivationInvarianceTrainer(Trainer):
         y = y.to(self.device)
 
         xadv = self.adversary.perturb(x, y)
-        logits, adv_logits, z_diff = self.compute_outputs(x, xadv)
+        logits, adv_logits, z_diff, zz_diff = self.compute_outputs(x, xadv, y)
 
         cln_acc, _ = compute_accuracy(logits, y)
         adv_acc, _ = compute_accuracy(adv_logits, y)
@@ -67,14 +88,24 @@ class ActivationInvarianceTrainer(Trainer):
         
         loss = cln_classification_loss + self.args.adv_loss_wt*adv_classification_loss
         z_diff_norm = torch.norm(z_diff, p=2, dim=1)**2
-        if self.args.z_wt > 0:
-            if self.model.training and self.args.use_MoM:
-                if isinstance(self.optimizer.L, int):
-                    self.optimizer.L = torch.zeros((z_diff.shape[1],1), device=z_diff.device) + self.optimizer.L
-                z_term = z_diff.mm(self.optimizer.L).squeeze() + (self.optimizer.c * z_diff_norm)/2            
+        if len(zz_diff) > 0:
+            zz_diff_norm = zz_diff.pow(2).sum(1)
+        else:
+            zz_diff_norm = 0
+        if self.model.training and self.args.use_MoM:
+            if len(zz_diff) > 0:
+                z_diff = torch.cat((z_diff, zz_diff), dim=1)
+            if isinstance(self.optimizer.L, int):
+                self.optimizer.L = torch.zeros((z_diff.shape[1],1), device=z_diff.device) + self.optimizer.L
+            z_term = z_diff.mm(self.optimizer.L).squeeze() + (self.optimizer.c * (z_diff_norm + zz_diff_norm))/2            
+        elif self.args.z_wt > 0:
+            if self.args.z_criterion == 'cosine-spread':                
+                zz_diff_norm = zz_diff.sum(1)
+                z_diff_norm = z_diff.sum(1)
+                z_term = self.args.z_wt*z_diff_norm + self.args.zz_wt*zz_diff_norm
             else:
                 z_term = self.args.z_wt*(z_diff_norm)
-            loss += z_term.mean()
+        loss += z_term.mean()
 
         if self.model.training and self.args.use_MoM:
             self.optimizer.zero_grad()
@@ -82,7 +113,9 @@ class ActivationInvarianceTrainer(Trainer):
             nn.utils.clip_grad_norm_(self.model.parameters(), 5)
             self.optimizer.step()
             with torch.no_grad():
-                _, _, z_diff = self.compute_outputs(x, xadv)
+                _, _, z_diff, zz_diff = self.compute_outputs(x, xadv, y)
+                if len(zz_diff) > 0:
+                    z_diff = torch.cat((z_diff, zz_diff), dim=1)
                 self.optimizer.L += self.optimizer.c * z_diff.mean(0).unsqueeze(1)
             self.optimizer.c *= self.args.c_step_size
             loss.detach()            
@@ -90,7 +123,8 @@ class ActivationInvarianceTrainer(Trainer):
                              'train_adv_accuracy': adv_acc,
                              'train_accuracy': (cln_acc + adv_acc) / 2,
                              'train_loss': float(loss.detach().cpu()),
-                             'train_Z_loss': float(z_diff_norm.max().detach().cpu())}
+                             'train_Z_loss': float(z_diff_norm.max().detach().cpu()),
+                             'train_ZZ_loss': float(zz_diff_norm.max().detach().cpu()) if len(zz_diff) > 0 else 0}
 
     def admm_training_step(self, batch, batch_idx):
         if hasattr(self, 'model2'):
@@ -205,52 +239,6 @@ class ActivationInvarianceTrainer(Trainer):
                              'train_adv_accuracy': adv_acc,
                              'train_loss': float(loss.detach().cpu()),
                              'train_Z_loss': float(z_loss.detach().cpu())}
-def make_val_dataset(dataset, num_classes):
-    train_idxs = []        
-    val_idxs = []
-    class_counts = {i:0 for i in range(num_classes)}
-    train_class_counts = 4500
-
-    for i,sample in enumerate(dataset):
-        y = sample[1]
-        if class_counts[y] < train_class_counts:      
-            train_idxs.append(i)
-            class_counts[y] += 1
-        else:
-            val_idxs.append(i)
-    print(len(train_idxs), len(val_idxs))
-    return train_idxs, val_idxs
-
-def get_cifar10_dataset(datafolder, custom_transforms=None):
-    common_transform = torchvision.transforms.Compose([
-        torchvision.transforms.RandomCrop(32, padding=4, padding_mode='reflect'),
-        torchvision.transforms.RandomHorizontalFlip(),
-        torchvision.transforms.ToTensor(),        
-    ])
-
-    test_transform = torchvision.transforms.Compose([
-        torchvision.transforms.ToTensor(),        
-    ])
-
-    if custom_transforms is not None:
-        train_transform, test_transform = custom_transforms
-    else:
-        train_transform = common_transform    
-
-    print(train_transform)
-    print(test_transform)
-    
-    nclasses = 10
-    train_dataset = torchvision.datasets.CIFAR10('%s/'%datafolder, 
-            transform=train_transform, download=True)
-    train_idxs, val_idxs = make_val_dataset(train_dataset, nclasses)
-    val_dataset = Subset(train_dataset, val_idxs)
-    train_dataset = Subset(train_dataset, train_idxs)
-   
-    test_dataset = torchvision.datasets.CIFAR10('%s/'%datafolder, train=False,
-            transform=test_transform, download=True)        
-    
-    return train_dataset, val_dataset, test_dataset, nclasses
 
 def add_gaussian_smoothing_layers(model:LayeredModel):
     for i,l in enumerate(model.layers):
@@ -296,7 +284,7 @@ def train(args):
     args.use_MoM = 'MoM' in args.optimizer
 
     args.logdir = os.path.join(args.logdir, "%s_%s" % (model.name, args.exp_name))
-    exp_num = max([int(x.split('_')[1]) for x in os.listdir(args.logdir)]) if (os.path.exists(args.logdir) and len(os.listdir(args.logdir)) > 0) else 0
+    exp_num = 1 + max([int(x.split('_')[1]) for x in os.listdir(args.logdir)]) if (os.path.exists(args.logdir) and len(os.listdir(args.logdir)) > 0) else 0
     args.logdir = os.path.join(args.logdir, 'exp_%d' % exp_num)
     print('logging to ', args.logdir)
 
@@ -372,6 +360,7 @@ if __name__ == '__main__':
     parser.add_argument('--std', type=float, default=0.25)
 
     parser.add_argument('--z_wt', type=float, default=1e-3)
+    parser.add_argument('--zz_wt', type=float, default=1e-3)
     parser.add_argument('--adv_loss_wt', type=float, default=1)
     parser.add_argument('--adv_ratio', type=float, default=1.)
     parser.add_argument('--detach_adv_logits', action='store_true')
