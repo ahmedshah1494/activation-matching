@@ -38,6 +38,17 @@ class ActivationInvarianceTrainer(Trainer):
             if self.args.z_criterion == 'diff':
                 _z_diff = z-zadv
                 zzadv_diff.append(_z_diff.view(z.shape[0], -1))
+            if self.args.z_criterion == 'diff-spread':
+                _z_diff = z-zadv
+                
+                z = z.view(z.shape[0], -1)
+                pw_dist = (z.unsqueeze(1) - z.unsqueeze(0)).view(-1, z.shape[1])
+                pw_dist_std = torch.std(pw_dist, dim=0).detach()
+
+                _z_diff = _z_diff.view(z.shape[0], -1)                
+                _z_diff = _z_diff/pw_dist_std
+
+                zzadv_diff.append(_z_diff)
             elif self.args.z_criterion == 'cosine':
                 z = z.view(z.shape[0], -1)
                 zadv = zadv.view(z.shape[0], -1)
@@ -73,7 +84,7 @@ class ActivationInvarianceTrainer(Trainer):
         cln_acc, _ = compute_accuracy(logits, y)
         adv_acc, _ = compute_accuracy(adv_logits, y)
 
-        if self.model.training:
+        if self.model.training and self.args.adv_ratio < 1:
             selected_adv = np.random.binomial(1, p=self.args.adv_ratio, size=len(logits)).astype(bool)
             while selected_adv.all() or (not selected_adv.any()):
                 selected_adv = np.random.binomial(1, p=self.args.adv_ratio, size=len(logits)).astype(bool)
@@ -83,10 +94,11 @@ class ActivationInvarianceTrainer(Trainer):
             
         logits = logits[selected_cln]
         adv_logits = adv_logits[selected_adv]
-        cln_classification_loss = torch.nn.functional.cross_entropy(logits, y[selected_cln])
-        adv_classification_loss = torch.nn.functional.cross_entropy(adv_logits, y[selected_adv])
-        
-        loss = cln_classification_loss + self.args.adv_loss_wt*adv_classification_loss
+        loss = cln_classification_loss = torch.nn.functional.cross_entropy(logits, y[selected_cln])
+        if self.args.adv_loss_wt > 0:
+            adv_classification_loss = torch.nn.functional.cross_entropy(adv_logits, y[selected_adv])
+            loss += self.args.adv_loss_wt*adv_classification_loss
+            
         z_diff_norm = torch.norm(z_diff, p=2, dim=1)**2
         if len(zz_diff) > 0:
             zz_diff_norm = zz_diff.pow(2).sum(1)
@@ -273,6 +285,8 @@ def train(args):
         'wide_resnet-10': lambda : WideResnet(args, 28, 10, 0, num_classes)
     }
     model = model_dict[args.model_name]().to(device)
+    if len(args.layer_idxs) == 0:
+        model.args.layer_idxs = torch.arange(len(model.layers))
     if args.optimizer == 'adam':
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=0.0005)
     elif args.optimizer == 'sgd':
@@ -323,10 +337,6 @@ def test(args):
     trainer.logger.close()
 
 if __name__ == '__main__':
-    np.random.seed(9999)
-    torch.random.manual_seed(9999)
-    torch.cuda.manual_seed(9999)
-
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', default='cifar10')
     parser.add_argument('--datafolder', default='/home/mshah1/workhorse3')
@@ -369,6 +379,12 @@ if __name__ == '__main__':
 
     parser.add_argument('--regress_on_logits', action='store_true')
     parser.add_argument('--normalize_activations', action='store_true')
+
+    parser.add_argument('--random_seed', type=int, default=9999)
+
+    np.random.seed(9999)
+    torch.random.manual_seed(9999)
+    torch.cuda.manual_seed(9999)
 
     args = parser.parse_args()
     args.layer_idxs = torch.tensor(args.layer_idxs)
