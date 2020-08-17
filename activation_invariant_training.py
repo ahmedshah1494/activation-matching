@@ -10,18 +10,40 @@ from copy import deepcopy
 import argparse
 from utils import get_cifar10_dataset
 import os
+from trades import trades_loss
+
+def logit_cross_entropy(logits_p, logits_q, T=1):
+    p = torch.softmax(logits_p/T, dim=1)
+    q = torch.log_softmax(logits_q/T, dim=1)
+    return torch.mean(torch.sum(-p*q, dim=1))
 
 class ActivationInvarianceTrainer(Trainer):
     def __init__(self, model:LayeredModel, train_loader, val_loader, test_loader, optimizer, scheduler, device, args):
-        super(ActivationInvarianceTrainer, self).__init__(model, train_loader, val_loader, test_loader, optimizer, scheduler, device, args)
+        super(ActivationInvarianceTrainer, self).__init__(model, train_loader, val_loader, test_loader, optimizer, scheduler, device, args)                
         attack_class, kwargs = extract_attack(args)
-        self.adversary = attack_class(self.model, **kwargs)
+        self.training_adversary = self.test_adversary = attack_class(self.model, **kwargs)
+        if self.args.maximize_logit_divergence:
+            attack_class, kwargs = extract_attack(args, loss_fn=logit_cross_entropy)
+            self.training_adversary = attack_class(self.model, **kwargs)
 
-    def compute_outputs(self, x, xadv, y, model=None):
-        if model is None:
-            model = self.model
-        logits, interm_Z = model(x, store_intermediate=True)        
+    def compute_outputs(self, x, y, xadv=None):
+        model = self.model
+        logits, interm_Z = model(x, store_intermediate=True)
+        if xadv is None:            
+            if model.training:
+                model.requires_grad_(False)
+                model = model.train(False)
+                if self.args.maximize_logit_divergence:                    
+                    xadv = self.training_adversary.perturb(x, logits.detach())
+                else:
+                    xadv = self.training_adversary.perturb(x, y)    
+                model = model.train(True)
+                model.requires_grad_(True)
+            else:
+                xadv = self.test_adversary.perturb(x, y)
+        
         adv_logits, interm_Zadv = model(xadv, store_intermediate=True)        
+        
         if self.args.detach_adv_logits:
             C = self.model.layers[-2].requires_grad_(False)
             adv_logits = C(interm_Zadv[-1])
@@ -38,7 +60,7 @@ class ActivationInvarianceTrainer(Trainer):
             if self.args.z_criterion == 'diff':
                 _z_diff = z-zadv
                 zzadv_diff.append(_z_diff.view(z.shape[0], -1))
-            if self.args.z_criterion == 'diff-spread':
+            elif self.args.z_criterion == 'diff-spread':
                 _z_diff = z-zadv
                 
                 z = z.view(z.shape[0], -1)
@@ -71,15 +93,14 @@ class ActivationInvarianceTrainer(Trainer):
         if len(zz_diff) > 0:
             zz_diff = torch.cat(zz_diff, dim=1)
         zzadv_diff = torch.cat(zzadv_diff, dim=1)
-        return logits, adv_logits, zzadv_diff, zz_diff
+        return xadv, logits, adv_logits, zzadv_diff, zz_diff
 
     def train_step(self, batch, batch_idx):
         x,y = batch
         x = x.to(self.device)
         y = y.to(self.device)
-
-        xadv = self.adversary.perturb(x, y)
-        logits, adv_logits, z_diff, zz_diff = self.compute_outputs(x, xadv, y)
+        
+        xadv, logits, adv_logits, z_diff, zz_diff = self.compute_outputs(x, y)
 
         cln_acc, _ = compute_accuracy(logits, y)
         adv_acc, _ = compute_accuracy(adv_logits, y)
@@ -91,14 +112,13 @@ class ActivationInvarianceTrainer(Trainer):
             selected_cln = (~ selected_adv)
         else:
             selected_adv = selected_cln = np.ones((len(logits,))).astype(bool)
-            
-        logits = logits[selected_cln]
-        adv_logits = adv_logits[selected_adv]
-        loss = cln_classification_loss = torch.nn.functional.cross_entropy(logits, y[selected_cln])
+        loss = cln_classification_loss = torch.nn.functional.cross_entropy(logits[selected_cln], y[selected_cln])        
         if self.args.adv_loss_wt > 0:
-            adv_classification_loss = torch.nn.functional.cross_entropy(adv_logits, y[selected_adv])
-            loss += self.args.adv_loss_wt*adv_classification_loss
-            
+            if self.args.maximize_logit_divergence:
+                adv_classification_loss = self.training_adversary.loss_fn(adv_logits[selected_adv], logits[selected_adv])
+            else:
+                adv_classification_loss = self.training_adversary.loss_fn(adv_logits[selected_adv], y[selected_adv])
+            loss += self.args.adv_loss_wt*adv_classification_loss        
         z_diff_norm = torch.norm(z_diff, p=2, dim=1)**2
         if len(zz_diff) > 0:
             zz_diff_norm = zz_diff.pow(2).sum(1)
@@ -117,15 +137,16 @@ class ActivationInvarianceTrainer(Trainer):
                 z_term = self.args.z_wt*z_diff_norm + self.args.zz_wt*zz_diff_norm
             else:
                 z_term = self.args.z_wt*(z_diff_norm)
-        loss += z_term.mean()
-
+        else:
+            z_term = 0
+        loss += z_term.mean() if isinstance(z_term, torch.Tensor) else 0        
         if self.model.training and self.args.use_MoM:
             self.optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(self.model.parameters(), 5)
             self.optimizer.step()
             with torch.no_grad():
-                _, _, z_diff, zz_diff = self.compute_outputs(x, xadv, y)
+                _, _, _, z_diff, zz_diff = self.compute_outputs(x, y, xadv)
                 if len(zz_diff) > 0:
                     z_diff = torch.cat((z_diff, zz_diff), dim=1)
                 self.optimizer.L += self.optimizer.c * z_diff.mean(0).unsqueeze(1)
@@ -137,38 +158,6 @@ class ActivationInvarianceTrainer(Trainer):
                              'train_loss': float(loss.detach().cpu()),
                              'train_Z_loss': float(z_diff_norm.max().detach().cpu()),
                              'train_ZZ_loss': float(zz_diff_norm.max().detach().cpu()) if len(zz_diff) > 0 else 0}
-
-    def admm_training_step(self, batch, batch_idx):
-        if hasattr(self, 'model2'):
-            self.model = self.model.cpu()
-            self.model2 = deepcopy(self.model).to(self.device)
-            self.model = self.model.to(self.device)
-
-        def model1_loss(x, y, logits, adv_logits, z_diff):
-            cln_classification_loss = torch.nn.functional.cross_entropy(logits, y)
-            adv_classification_loss = torch.nn.functional.cross_entropy(adv_logits, y)
-
-            loss = cln_classification_loss + self.args.adv_loss_wt*adv_classification_loss
-            return loss
-        
-        def model2_loss(x, y, logits, adv_logits, z_diff):
-            loss = torch.norm(z_diff, p=2, dim=1).sum()
-            return loss
-
-        def constraint():
-            param_diff = 0
-            for p1,p2 in (self.model1.parameters(),self.model2.parameters):
-                param_diff = ((p1-p2)**2).sum()
-            return 
-
-        x,y = batch
-        x = x.to(self.device)
-        y = y.to(self.device)
-
-        xadv = self.adversary.perturb(x, y)
-
-        logits, adv_logits, z_diff = self.compute_outputs(x, xadv)
-        loss = model1_loss(x, y, logits, adv_logits, z_diff)
     def _optimization_wrapper(self, func):        
         if self.args.use_MoM:
             return func
@@ -180,77 +169,34 @@ class ActivationInvarianceTrainer(Trainer):
                 nn.utils.clip_grad_norm_(self.model.parameters(), 5)
                 self.optimizer.step()
                 return output, logs
-            return wrapper
+            return wrapper    
 
-    # def admm_train_step(self, batch, batch_idx):
+class TRADESTrainer(Trainer):
+    def __init__(self, model, train_loader, val_loader, test_loader, optimizer, scheduler, device, args):
+        super().__init__(model, train_loader, val_loader, test_loader, optimizer, scheduler, device, args)
+        attack_class, kwargs = extract_attack(args)
+        self.adversary = attack_class(self.model, **kwargs)
+    def train_step(self, batch, batch_idx):
         x,y = batch
         x = x.to(self.device)
         y = y.to(self.device)
-
-        (model1, model2, u) = self.model
-
-        def get_loss():
+                
+        if self.model.training:
+            loss, logits, adv_logits = trades_loss(self.model, x, y, self.optimizer, self.args.eps_iter, self.args.eps, self.args.nb_iter, self.args.adv_loss_wt)
+        else:
             xadv = self.adversary.perturb(x, y)
-            logits, interm_Z = model1(x, store_intermediate=True)        
-            adv_logits, interm_Zadv = model2(xadv, store_intermediate=True)
-            if self.args.detach_adv_logits:
-                C = self.model.layers[-2].requires_grad_(False)
-                adv_logits = C(interm_Zadv[-1])
-                C.requires_grad_(True)
-            
-            if self.args.regress_on_logits:
-                interm_Z.append(logits)
-                interm_Zadv.append(adv_logits)
-
-            cln_classification_loss = torch.nn.functional.cross_entropy(logits, y)
-            adv_classification_loss = torch.nn.functional.cross_entropy(adv_logits, y)
-            z_loss = 0
-            for i, (z, zadv) in enumerate(zip(interm_Z, interm_Zadv)):            
-                _z_loss = torch.nn.functional.mse_loss(z, zadv, reduction='none')
-                z_loss += _z_loss.view(z.shape[0], -1).sum(1).mean()        
-
-            quad_term = 0
-            for p1,p2 in zip(model1.parameters(), model2.parameters()):
-                quad_term += torch.nn.functional.mse_loss(p1, p2, reduction='sum')
-
-            loss = cln_classification_loss + self.args.adv_loss_wt*adv_classification_loss + u * z_loss + self.args.rho*quad_term/2
-            return loss, logits, adv_logits, z_loss
-
-        model2_grad_state = []
-        for p in model2.parameters():
-            model2_grad_state.append(p.requires_grad)
-            p.requires_grad_(False)
-
-        loss = get_loss()
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-
-        for p, s in zip(model2.parameters(), model2_grad_state):
-            p.requires_grad_(s)
+            logits = self.model(x)
+            adv_logits = self.model(xadv)
+            loss = torch.nn.functional.cross_entropy(logits, y)
+            loss += torch.nn.functional.cross_entropy(adv_logits, y)
         
-        model1_grad_state = []
-        for p in model1.parameters():
-            model1_grad_state.append(p.requires_grad)
-            p.requires_grad_(False)
+        cln_acc, _ = compute_accuracy(logits, y)
+        adv_acc, _ = compute_accuracy(adv_logits, y)
         
-        loss = get_loss()
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        
-        quad_term = 0
-        for p1,p2 in zip(model1.parameters(), model2.parameters()):
-            quad_term += torch.nn.functional.mse_loss(p1, p2, reduction='sum')
-
-        u += args.rho*quad_term
-
-        cln_acc, _ = compute_accuracy(logits.detach().cpu(), y.detach().cpu())
-        adv_acc, _ = compute_accuracy(adv_logits.detach().cpu(), y.detach().cpu())
-        return {'loss':loss}, {'train_clean_accuracy': cln_acc,
+        return {'loss': loss}, {'train_clean_accuracy': cln_acc,
                              'train_adv_accuracy': adv_acc,
-                             'train_loss': float(loss.detach().cpu()),
-                             'train_Z_loss': float(z_loss.detach().cpu())}
+                             'train_accuracy': (cln_acc + adv_acc) / 2,
+                             'train_loss': float(loss.detach().cpu()),}
 
 def add_gaussian_smoothing_layers(model:LayeredModel):
     for i,l in enumerate(model.layers):
@@ -304,6 +250,10 @@ def train(args):
 
     if args.attack == 'none':
         trainer_class = Trainer
+        mode = 'max'
+        metric = 'val_accuracy'
+    elif args.TRADES:
+        trainer_class = TRADESTrainer
         mode = 'max'
         metric = 'val_accuracy'
     else:
@@ -368,6 +318,7 @@ if __name__ == '__main__':
     parser.add_argument('--eps_iter', type=float, default=8/(255*4))
     parser.add_argument('--max_iters', type=int, default=7)
     parser.add_argument('--std', type=float, default=0.25)
+    parser.add_argument('--maximize_logit_divergence', action='store_true')
 
     parser.add_argument('--z_wt', type=float, default=1e-3)
     parser.add_argument('--zz_wt', type=float, default=1e-3)
@@ -381,6 +332,8 @@ if __name__ == '__main__':
     parser.add_argument('--normalize_activations', action='store_true')
 
     parser.add_argument('--random_seed', type=int, default=9999)
+
+    parser.add_argument('--TRADES', action='store_true')
 
     np.random.seed(9999)
     torch.random.manual_seed(9999)
