@@ -108,7 +108,7 @@ class LayeredModel(nn.Module):
     def forward(self, x, store_intermediate=False):
         Z = []
         if hasattr(self.args, 'normalize_input') and self.args.normalize_input:
-            x = batch_per_image_standardization(x)
+            x = utils.normalize_image_tensor(x, **(utils.dataset_stats[self.args.dataset]))
         z = x
         for i,l in enumerate(self.layers):
             _z = l(z)
@@ -119,8 +119,8 @@ class LayeredModel(nn.Module):
                 z = z_normed.view(*z_shape)
             else:
                 z = _z
-            if store_intermediate and i < len(self.layers)-1:
-                if hasattr(self.args, 'layer_idxs') and (i in self.args.layer_idxs or len(self.args.layer_idxs)==0):
+            if store_intermediate:
+                if hasattr(self.args, 'layer_idxs') and (i in self.args.layer_idxs or len(self.args.layer_idxs)==0):                    
                     Z.append(z)
         if store_intermediate:
             return z, Z
