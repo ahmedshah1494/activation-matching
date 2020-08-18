@@ -96,6 +96,21 @@ def set_grad(var):
         var.grad = grad
     return hook
 
+class ActivationNormalization(nn.Module):
+    def __init__(self):
+        super(ActivationNormalization, self).__init__()
+        self.alpha = nn.Parameter(torch.ones((1,)))
+        self.beta = nn.Parameter(torch.zeros((1,)))
+    
+    def forward(self, z):
+        z_shape = z.shape
+        z = z.view(z_shape[0], -1)
+        z_normed = z/torch.norm(z, p=2, dim=1, keepdim=True)
+        z_normed = z_normed.view(*z_shape)        
+        z_normed = self.alpha * z_normed        
+        return z_normed
+
+
 class LayeredModel(nn.Module):
     def __init__(self, args):
         super(LayeredModel, self).__init__()
@@ -211,47 +226,93 @@ class VGG16(LayeredModel):
         super(VGG16, self).__init__(args)
         self.name = 'VGG16'
 
-        self.layers = nn.ModuleList([
-            self.conv_bn_act(3, 64, 3, 1),
-            self.conv_bn_act(64, 64, 3, 1),
-            self.conv_bn_act_pooling(64, 64, 3, 1, 2, 2),
-            self.conv_bn_act(64, 128, 3, 1),
-            self.conv_bn_act_pooling(128, 128, 3, 1, 2, 2),
-            self.conv_bn_act(128, 256, 3, 1),            
-            self.conv_bn_act_pooling(256, 256, 3, 1, 2, 2),
-            self.conv_bn_act(256, 512, 3, 1),
-            self.conv_bn_act(512, 512, 3, 1),
-            self.conv_bn_act_pooling(512, 512, 1, 0, 2, 2),
-            self.conv_bn_act(512, 512, 3, 1),
-            self.conv_bn_act(512, 512, 3, 1),
-            nn.Sequential(
+        if hasattr(self.args, 'use_preactivation') and self.args.use_preactivation:
+            self.layers = nn.ModuleList([
+                nn.Conv2d(3, 64, 3, padding=1),
+                self.conv_bn_act(64, 64, 3, 1),
+                self.conv_bn_act(64, 64, 3, 1),
+                self.conv_bn_act_pooling(64, 128, 3, 1 ,2, 2),
+                self.conv_bn_act(128, 128, 3, 1),
+                self.conv_bn_act_pooling(128, 256, 3, 1 ,2, 2),
+                self.conv_bn_act(256, 256, 3, 1),
+                self.conv_bn_act_pooling(256, 512, 3, 1 ,2, 2),
+                self.conv_bn_act(512, 512, 3, 1),
+                self.conv_bn_act(512, 512, 3, 1),
+                self.conv_bn_act_pooling(512, 512, 3, 1 ,2, 2),
+                self.conv_bn_act(512, 512, 3, 1),
+                self.conv_bn_act(512, 512, 3, 1),
+                nn.Sequential(
+                    self.bn_act(512),
+                    nn.MaxPool2d(kernel_size=2, stride=2),
+                    nn.AdaptiveAvgPool2d((1,1)),
+                    Flatten(),
+                    nn.Linear(512, num_classes),
+                ),                
+            ])
+        else:
+            self.layers = nn.ModuleList([
+                self.conv_bn_act(3, 64, 3, 1),
+                self.conv_bn_act(64, 64, 3, 1),
+                self.conv_bn_act_pooling(64, 64, 3, 1, 2, 2),
+                self.conv_bn_act(64, 128, 3, 1),
+                self.conv_bn_act_pooling(128, 128, 3, 1, 2, 2),
+                self.conv_bn_act(128, 256, 3, 1),            
+                self.conv_bn_act_pooling(256, 256, 3, 1, 2, 2),
+                self.conv_bn_act(256, 512, 3, 1),
+                self.conv_bn_act(512, 512, 3, 1),
                 self.conv_bn_act_pooling(512, 512, 1, 0, 2, 2),
-                nn.AdaptiveAvgPool2d((1,1)),
-                Flatten(),
-            ),
-            nn.Linear(512, num_classes),
-        ])
+                self.conv_bn_act(512, 512, 3, 1),
+                self.conv_bn_act(512, 512, 3, 1),
+                nn.Sequential(
+                    self.conv_bn_act_pooling(512, 512, 1, 0, 2, 2),
+                    nn.AdaptiveAvgPool2d((1,1)),
+                    Flatten(),
+                ),
+                nn.Linear(512, num_classes),
+            ])
     
     def init_mask(self):
         output_sizes = [64,64,64,128,128,256,256,512,512,512,512,512]        
         mask_layers = [nn.Parameter(torch.rand(s)) for s in output_sizes]
         return mask_layers
-    def conv_bn_act(self, in_channels, out_channels, kernel_size, padding):
-        module = nn.Sequential(
-            nn.Conv2d(in_channels,out_channels, kernel_size=kernel_size, padding=padding),
-            nn.BatchNorm2d(out_channels),
+
+    def bn_act(self, in_channels):
+        return nn.Sequential(
+            nn.BatchNorm2d(in_channels),
             nn.ELU(inplace=True)
         )
-        return module
+    def conv_bn_act(self, in_channels, out_channels, kernel_size, padding):
+        if hasattr(self.args, 'use_preactivation') and self.args.use_preactivation:
+            module = [
+                self.bn_act(in_channels),
+                nn.Conv2d(in_channels,out_channels, kernel_size=kernel_size, padding=padding),                
+            ]
+        else:
+            module = [
+                nn.Conv2d(in_channels,out_channels, kernel_size=kernel_size, padding=padding),
+                self.bn_act(out_channels)
+            ]
+        if self.args.normalize_activations:
+            module.append(ActivationNormalization())
+        return nn.Sequential(*module)
     
     def conv_bn_act_pooling(self, in_channels, out_channels, kernel_size, padding, pooling_kernel_size, pooling_stride):
-        module = nn.Sequential(
-            nn.Conv2d(in_channels,out_channels, kernel_size=kernel_size, padding=padding),
-            nn.BatchNorm2d(out_channels),
-            nn.ELU(inplace=True),
-            nn.MaxPool2d(kernel_size=pooling_kernel_size, stride=pooling_stride),
-        )
-        return module
+        if hasattr(self.args, 'use_preactivation') and self.args.use_preactivation:
+            module = [
+                self.bn_act(in_channels),
+                nn.MaxPool2d(kernel_size=pooling_kernel_size, stride=pooling_stride),
+                nn.Conv2d(in_channels,out_channels, kernel_size=kernel_size, padding=padding),                
+            ]
+        else:
+            module = [
+                nn.Conv2d(in_channels,out_channels, kernel_size=kernel_size, padding=padding),
+                self.bn_act(out_channels),
+                nn.MaxPool2d(kernel_size=pooling_kernel_size, stride=pooling_stride),
+            ]
+            
+        if self.args.normalize_activations:
+            module.append(ActivationNormalization())
+        return nn.Sequential(*module)
 
 class WideResnet(LayeredModel):
     def __init__(self, args, depth, widen_factor, dropout_rate, num_classes):
