@@ -26,7 +26,7 @@ def compute_diff_spread(z, zadv):
 def compute_cosine_metric(z, zadv, dim=1):
     return 1 - nn.functional.cosine_similarity(z, zadv, dim=dim)
 
-def compute_cosine_spread(z, zadv, label_mask):
+def compute_cosine_spread(z, zadv, label_mask, do_abs=True):
     z = reshape2D(z)
     zadv = reshape2D(zadv)
 
@@ -35,7 +35,8 @@ def compute_cosine_spread(z, zadv, label_mask):
     
     zz_cos = normed_z.mm(normed_z.transpose(0,1)) * label_mask                
     zz_cos[label_mask == -1] += 1
-    zz_cos[label_mask == 1] = torch.abs(zz_cos[label_mask == 1])                
+    # if do_abs:
+    zz_cos[label_mask == 1] = 1 + zz_cos[label_mask == 1]
     zz_cos = (zz_cos).mean(1, keepdim=True)
     
     zzadv_cos = compute_cosine_metric(z, zadv, 1).unsqueeze(1)
@@ -72,6 +73,15 @@ def logit_cross_entropy(logits, target_logits, T=1):
     q = torch.log_softmax(logits/T, dim=1)
     return nn.KLDivLoss(size_average=False)(q, p)
 
+class ActivationExtractorWrapper(nn.Module):
+    def __init__(self, model:LayeredModel):
+        super(ActivationExtractorWrapper, self).__init__()
+        self.model = model        
+    def forward(self, x):
+        _, Z = self.model(x, store_intermediate=True)
+        Z = torch.cat([reshape2D(z) for z in Z], dim=1)
+        return Z
+
 class ActivationInvarianceTrainer(Trainer):
     def __init__(self, model, train_loader, val_loader, test_loader, optimizer, scheduler, device, args):
         super().__init__(model, train_loader, val_loader, test_loader, optimizer, scheduler, device, args)
@@ -79,14 +89,28 @@ class ActivationInvarianceTrainer(Trainer):
         attack_class, kwargs = extract_attack(args)
         self.test_adversary = attack_class(self.model, **kwargs)
         if self.args.maximize_logit_divergence:
-            loss_fn = {
-                'KL': logit_cross_entropy,
-                'cosine': lambda x,y: compute_cosine_metric(x, y, 1).sum()
-            }[self.args.adv_logit_loss]
-            attack_class, kwargs = extract_attack(args, loss_fn=loss_fn)
-            self.training_adversary = attack_class(self.model, **kwargs)
+            loss_fn = lambda x, y: logit_cross_entropy(x, y, args.T)
+            adv_model = model            
+        elif self.args.adv_loss_fn == 'z_cos':
+            def z_cos(Zadv, Z):
+                cos = torch.bmm(Zadv.unsqueeze(1), Z.unsqueeze(2)).squeeze()                
+                return (len(args.layer_idxs) - cos).sum(0)
+            loss_fn = z_cos
+            adv_model = ActivationExtractorWrapper(model)
+        elif self.args.adv_loss_fn == 'z_diff':
+            def z_diff(Zadv, Z):
+                diff = (Zadv - Z).pow(2).sum()
+                return diff
+            loss_fn = z_diff
+            adv_model = ActivationExtractorWrapper(model)
+        elif self.args.adv_loss_fn == 'xent':
+            loss_fn = nn.CrossEntropyLoss(reduction='sum')
+            adv_model = model
         else:
-            self.training_adversary = self.test_adversary
+            raise NotImplementedError
+        print(loss_fn)
+        attack_class, kwargs = extract_attack(args, loss_fn=loss_fn)
+        self.training_adversary = attack_class(adv_model, **kwargs)
 
     def compute_z_criterion(self, Z, Zadv, y):
         y_ = (y + 1).unsqueeze(1).float()
@@ -108,23 +132,30 @@ class ActivationInvarianceTrainer(Trainer):
                 _z_diff = compute_cosine_metric(z, zadv, 1)
                 zzadv_diff.append(_z_diff.view(z.shape[0], -1))
             elif self.args.z_criterion == 'cosine-spread':
-                zz_cos, zzadv_cos = compute_cosine_spread(z, zadv, label_mask)
+                zz_cos, zzadv_cos = compute_cosine_spread(z, zadv, label_mask, not self.args.use_MoM)
                 zz_diff.append(zz_cos)
                 zzadv_diff.append(zzadv_cos)
+            else:
+                raise NotImplementedError(self.args.z_criterion)
         if len(zz_diff) > 0:
             zz_diff = torch.cat(zz_diff, dim=1)
         zzadv_diff = torch.cat(zzadv_diff, dim=1)
         return zzadv_diff, zz_diff
 
-    def compute_adversarial(self, x, y, logits):
+    def compute_adversarial(self, x, y, logits=None, Z=None):
         model = self.model
         model.requires_grad_(False)
         if model.training:            
             model = model.train(False)
             if self.args.maximize_logit_divergence:                    
                 xadv = self.training_adversary.perturb(x, logits)
+            elif self.args.adv_loss_fn == 'z_cos':
+                Z = torch.cat([reshape2D(z) for z in Z], dim=1)
+                xadv = self.training_adversary.perturb(x, Z)
+            elif self.args.adv_loss_fn == 'xent':
+                xadv = self.training_adversary.perturb(x, y)
             else:
-                xadv = self.training_adversary.perturb(x, y)    
+                raise NotImplementedError
             model = model.train(True)            
         else:
             xadv = self.test_adversary.perturb(x, y)
@@ -134,35 +165,34 @@ class ActivationInvarianceTrainer(Trainer):
     def compute_outputs(self, x, y, xadv=None):
         model = self.model
         logits, interm_Z = model(x, store_intermediate=True)
-        xadv = self.compute_adversarial(x, y, logits)
+        if xadv is None:
+            xadv = self.compute_adversarial(x, y, logits, interm_Z)
         adv_logits, interm_Zadv = model(xadv, store_intermediate=True)
         zzadv_diff, zz_diff = self.compute_z_criterion(interm_Z, interm_Zadv, y)
         return xadv, logits, adv_logits, zzadv_diff, zz_diff
 
     def MoM_update(self, x, y, xadv, zzadv_diff, zz_diff, loss):
         zzadv_diff_norm = zzadv_diff.pow(2).sum(1)
-        zz_diff_norm = zz_diff.pow(2).sum(1)
-        z_diff_norm = zzadv_diff_norm + zz_diff_norm
-
-        if len(zz_diff) > 0:
-            z_diff = torch.cat((zzadv_diff, zz_diff), dim=1)
-        else:
-            z_diff = zzadv_diff
+        zz_diff_norm = zz_diff.sum(1).mean(0) if len(zz_diff) > 0 else 0
+        loss += self.args.zz_wt * zz_diff_norm
+        
+        z_diff_norm = zzadv_diff_norm
+        z_diff = zzadv_diff
         
         if isinstance(self.optimizer.L, int):
-                self.optimizer.L = torch.zeros((z_diff.shape[1],1), device=z_diff.device) + self.optimizer.L
+            self.optimizer.L = torch.zeros((z_diff.shape[1],1), device=z_diff.device) + self.optimizer.L
         z_term = z_diff.mm(self.optimizer.L).squeeze() + (self.optimizer.c * (z_diff_norm))/2
         loss += z_term.mean()
 
         loss.backward()
         nn.utils.clip_grad_norm_(self.model.parameters(), 5)
         self.optimizer.step()
+
         with torch.no_grad():
-            _, _, _, z_diff, zz_diff = self.compute_outputs(x, y, xadv)
-            if len(zz_diff) > 0:
-                z_diff = torch.cat((z_diff, zz_diff), dim=1)
+            _, _, _, z_diff, _ = self.compute_outputs(x, y, xadv)
             self.optimizer.L += self.optimizer.c * z_diff.mean(0).unsqueeze(1)
-        self.optimizer.c *= self.args.c_step_size
+            self.optimizer.c *= self.args.c_step_size
+
         loss = loss.detach()
         return loss, zzadv_diff_norm, zz_diff_norm
 
@@ -191,6 +221,10 @@ class ActivationInvarianceTrainer(Trainer):
             zz_diff_norm = zz_diff.sum(1)
             z_diff_norm = z_diff.sum(1)
             z_term = self.args.z_wt*z_diff_norm + self.args.zz_wt*zz_diff_norm
+        elif self.args.z_criterion == 'cosine':
+            z_diff_norm = z_diff.sum(1)
+            zz_diff_norm = 0
+            z_term = self.args.z_wt*(z_diff_norm)
         else:
             z_diff_norm = z_diff.pow(2).sum(1)
             zz_diff_norm = 0
@@ -215,7 +249,7 @@ class ActivationInvarianceTrainer(Trainer):
         if self.model.training and self.args.use_MoM:
             loss, zzadv_diff_norm, zz_diff_norm = self.MoM_update(x, y, xadv, zzadv_diff, zz_diff, loss)
         
-        if self.model.training:
+        if self.model.training and not self.args.use_MoM:
             for p in self.model.parameters():
                 assert (p.grad is None) or (p.grad == 0).all()
         return {'loss':loss}, {'train_clean_accuracy': cln_acc,
@@ -227,7 +261,9 @@ class ActivationInvarianceTrainer(Trainer):
     
     def _optimization_wrapper(self, func):        
         if self.args.use_MoM:
-            return func
+            def wrapper(*args, **kwargs):
+                self.optimizer.zero_grad()
+                return func(*args, **kwargs)            
         else:
             def wrapper(*args, **kwargs):
                 self.optimizer.zero_grad()
@@ -236,4 +272,4 @@ class ActivationInvarianceTrainer(Trainer):
                 nn.utils.clip_grad_norm_(self.model.parameters(), 5)
                 self.optimizer.step()
                 return output, logs
-            return wrapper
+        return wrapper
