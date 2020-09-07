@@ -15,12 +15,15 @@ def compute_diff_spread(z, zadv):
     _z_diff = z-zadv
                 
     z = reshape2D(z)
-    pw_dist = (z.unsqueeze(1) - z.unsqueeze(0)).view(-1, z.shape[1])
-    pw_dist_std = torch.std(pw_dist, dim=0).detach()
-
+    batch_size = z.shape[0]
+    pw_dist = (z.unsqueeze(1) - z.unsqueeze(0))
+    triu_idx = torch.triu_indices(batch_size, batch_size, 1)
+    pw_dist = pw_dist[triu_idx[0], triu_idx[1]]    
+    pw_dist_mean = pw_dist.abs().mean(0, keepdim=True)
+    pw_dist_mean = pw_dist_mean.detach()    
+    # pw_dist_std = torch.std(pw_dist, dim=0).detach()    
     _z_diff = reshape2D(_z_diff)
-    _z_diff = _z_diff/pw_dist_std
-
+    _z_diff = _z_diff/pw_dist_mean
     return _z_diff
 
 def compute_cosine_metric(z, zadv, dim=1):
@@ -89,7 +92,7 @@ class ActivationInvarianceTrainer(Trainer):
         attack_class, kwargs = extract_attack(args)
         self.test_adversary = attack_class(self.model, **kwargs)
         if self.args.maximize_logit_divergence:
-            loss_fn = lambda x, y: logit_cross_entropy(x, y, args.T)
+            loss_fn = lambda x, y: logit_cross_entropy(x, y)
             adv_model = model            
         elif self.args.adv_loss_fn == 'z_cos':
             def z_cos(Zadv, Z):
@@ -108,7 +111,11 @@ class ActivationInvarianceTrainer(Trainer):
             adv_model = model
         else:
             raise NotImplementedError
-        print(loss_fn)
+        self.logit_matching_fn = {
+            'KL': lambda x, y: logit_cross_entropy(x, y, args.T)/len(x),
+            'L2': lambda x, y: (x-y).pow(2).mean(),
+            'cosine':lambda x,y: compute_cosine_metric(x, y).mean()
+        }[self.args.logit_matching_fn]
         attack_class, kwargs = extract_attack(args, loss_fn=loss_fn)
         self.training_adversary = attack_class(adv_model, **kwargs)
 
@@ -144,7 +151,6 @@ class ActivationInvarianceTrainer(Trainer):
 
     def compute_adversarial(self, x, y, logits=None, Z=None):
         model = self.model
-        model.requires_grad_(False)
         if model.training:            
             model = model.train(False)
             if self.args.maximize_logit_divergence:                    
@@ -159,7 +165,6 @@ class ActivationInvarianceTrainer(Trainer):
             model = model.train(True)            
         else:
             xadv = self.test_adversary.perturb(x, y)
-        model.requires_grad_(True)
         return xadv
     
     def compute_outputs(self, x, y, xadv=None):
@@ -205,17 +210,18 @@ class ActivationInvarianceTrainer(Trainer):
         else:
             selected_adv = selected_cln = np.ones((len(logits,))).astype(bool)
         
-        loss = torch.nn.functional.cross_entropy(logits[selected_cln], y[selected_cln])
+        if self.args.cln_loss_wt > 0:
+            loss = self.args.cln_loss_wt * torch.nn.functional.cross_entropy(logits[selected_cln], y[selected_cln])
+        else:
+            loss = 0
         if self.args.adv_loss_wt > 0:
             if self.args.maximize_logit_divergence:
                 adv_classification_loss = self.training_adversary.loss_fn(adv_logits[selected_adv], logits[selected_adv])
-                if self.training_adversary.loss_fn == logit_cross_entropy:
-                    adv_classification_loss /= len(adv_logits[selected_adv])
             else:
                 adv_classification_loss = self.training_adversary.loss_fn(adv_logits[selected_adv], y[selected_adv])
+            loss += self.args.adv_loss_wt * adv_classification_loss / selected_adv.sum()            
         else:
             adv_classification_loss = 0
-        loss += self.args.adv_loss_wt * adv_classification_loss
         
         if self.args.z_criterion == 'cosine-spread':                
             zz_diff_norm = zz_diff.sum(1)
@@ -232,7 +238,13 @@ class ActivationInvarianceTrainer(Trainer):
 
         if (not self.args.use_MoM) and self.args.z_wt > 0:
             loss += z_term.mean()
-        return loss, z_diff_norm, zz_diff_norm
+
+        if self.args.match_logits:
+            logit_loss = self.logit_matching_fn(adv_logits[selected_adv], logits[selected_adv])
+            loss += self.args.logit_loss_wt * logit_loss
+        else:
+            logit_loss = 0        
+        return loss, z_diff_norm, zz_diff_norm, logit_loss
 
     def train_step(self, batch, batch_idx):
         x,y = batch
@@ -244,7 +256,7 @@ class ActivationInvarianceTrainer(Trainer):
         cln_acc, _ = compute_accuracy(logits, y)
         adv_acc, _ = compute_accuracy(adv_logits, y)
 
-        loss, zzadv_diff_norm, zz_diff_norm = self.compute_loss(logits, adv_logits, y, zzadv_diff, zz_diff)
+        loss, zzadv_diff_norm, zz_diff_norm, logit_loss = self.compute_loss(logits, adv_logits, y, zzadv_diff, zz_diff)
 
         if self.model.training and self.args.use_MoM:
             loss, zzadv_diff_norm, zz_diff_norm = self.MoM_update(x, y, xadv, zzadv_diff, zz_diff, loss)
@@ -256,6 +268,7 @@ class ActivationInvarianceTrainer(Trainer):
                              'train_adv_accuracy': adv_acc,
                              'train_accuracy': (cln_acc + adv_acc) / 2,
                              'train_loss': float(loss.detach().cpu()),
+                             'logit_loss': float(logit_loss.detach().cpu()) if isinstance(logit_loss, torch.Tensor) else logit_loss,
                              'train_Z_loss': float(zzadv_diff_norm.max().detach().cpu()),
                              'train_ZZ_loss': float(zz_diff_norm.max().detach().cpu()) if len(zz_diff) > 0 else 0}
     
