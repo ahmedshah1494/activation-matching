@@ -11,20 +11,22 @@ def reshape2D(x):
 def normalize_vector(x, dim):
     return x / torch.norm(x, p=2, dim=dim, keepdim=True)
 
-def compute_diff_spread(z, zadv):
-    _z_diff = z-zadv
+def compute_diff_spread(z, zadv, label_mask):
+    _z_diff = reshape2D(z-zadv).pow(2).sum(1)
                 
     z = reshape2D(z)
     batch_size = z.shape[0]
-    pw_dist = (z.unsqueeze(1) - z.unsqueeze(0))
-    triu_idx = torch.triu_indices(batch_size, batch_size, 1)
-    pw_dist = pw_dist[triu_idx[0], triu_idx[1]]    
-    pw_dist_mean = pw_dist.abs().mean(0, keepdim=True)
-    pw_dist_mean = pw_dist_mean.detach()    
-    # pw_dist_std = torch.std(pw_dist, dim=0).detach()    
-    _z_diff = reshape2D(_z_diff)
-    _z_diff = _z_diff/pw_dist_mean
-    return _z_diff
+
+    rand_idx = np.random.choice(np.arange(z.shape[0]), 32, replace=False)
+    _z = z[rand_idx]
+    label_mask = label_mask[:, rand_idx]    
+
+    pw_dist = (z.unsqueeze(1) - _z.unsqueeze(0)).pow(2).sum(2) * label_mask
+    # print(z.shape, _z.shape, label_mask.shape, pw_dist.shape)
+    # triu_idx = torch.triu_indices(batch_size, batch_size, 1)
+    # pw_dist = pw_dist[triu_idx[0], triu_idx[1]]
+    pw_dist_mean = pw_dist.mean(1)    
+    return _z_diff.view(-1,1), pw_dist_mean.view(-1, 1)
 
 def compute_cosine_metric(z, zadv, dim=1):
     return 1 - nn.functional.cosine_similarity(z, zadv, dim=dim)
@@ -126,22 +128,30 @@ class ActivationInvarianceTrainer(Trainer):
 
         zzadv_diff = []
         zz_diff = []
-        for i, (z, zadv) in enumerate(zip(Z, Zadv)):           
+        if self.args.layer_weighting == 'const':
+            layer_wts = np.ones((len(Z),))
+        elif self.args.layer_weighting == 'linear':
+            layer_wts = np.linspace(self.args.min_layer_wt, self.args.max_layer_wt, num=len(Z))
+        elif self.args.layer_weighting == 'exp':
+            layer_wts = np.geomspace(self.args.min_layer_wt, self.args.max_layer_wt, num=len(Z))
+
+        for i, (z, zadv, w) in enumerate(zip(Z, Zadv, layer_wts)):
             if self.args.z_criterion == 'diff':
                 _z_diff = reshape2D(z-zadv)
-                zzadv_diff.append(_z_diff)
+                zzadv_diff.append(w * _z_diff)
             elif self.args.z_criterion == 'diff-spread':
-                _z_diff = compute_diff_spread(z, zadv)
-                zzadv_diff.append(_z_diff)
+                _z_diff, _zz_diff = compute_diff_spread(z, zadv, label_mask)
+                zz_diff.append(w * _zz_diff)
+                zzadv_diff.append(w * _z_diff)
             elif self.args.z_criterion == 'cosine':
                 z = reshape2D(z)
                 zadv = reshape2D(zadv)
                 _z_diff = compute_cosine_metric(z, zadv, 1)
-                zzadv_diff.append(_z_diff.view(z.shape[0], -1))
+                zzadv_diff.append(w * _z_diff.view(z.shape[0], -1))
             elif self.args.z_criterion == 'cosine-spread':
                 zz_cos, zzadv_cos = compute_cosine_spread(z, zadv, label_mask, not self.args.use_MoM)
-                zz_diff.append(zz_cos)
-                zzadv_diff.append(zzadv_cos)
+                zz_diff.append(w * zz_cos)
+                zzadv_diff.append(w * zzadv_cos)
             else:
                 raise NotImplementedError(self.args.z_criterion)
         if len(zz_diff) > 0:
@@ -231,6 +241,10 @@ class ActivationInvarianceTrainer(Trainer):
             z_diff_norm = z_diff.sum(1)
             zz_diff_norm = 0
             z_term = self.args.z_wt*(z_diff_norm)
+        elif self.args.z_criterion == 'diff-spread':
+            z_diff_norm = z_diff.sum(1)
+            zz_diff_norm = zz_diff.sum(1)
+            z_term = self.args.z_wt*z_diff_norm + self.args.zz_wt*zz_diff_norm
         else:
             z_diff_norm = z_diff.pow(2).sum(1)
             zz_diff_norm = 0
