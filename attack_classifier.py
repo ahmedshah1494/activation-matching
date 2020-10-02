@@ -15,11 +15,14 @@ import os
 import sys
 from pytorch_lightning import Trainer
 
-from advertorch.attacks import LinfPGDAttack, L2PGDAttack, FGSM, CarliniWagnerL2Attack, JacobianSaliencyMapAttack, ChooseBestAttack
+from iterative_projected_gradient import LinfPGDAttack, L2PGDAttack
+from advertorch.attacks import FGSM, CarliniWagnerL2Attack, JacobianSaliencyMapAttack, ChooseBestAttack
 from advertorch.attacks.utils import attack_whole_dataset
 from advertorch_examples.utils import get_cifar10_test_loader, get_test_loader
 from advertorch.utils import get_accuracy
 from advertorch.loss import CWLoss
+
+from utils import get_cifar10_dataset
 
 class NullAdversary:
     def __init__(self,model,**kwargs):
@@ -30,12 +33,14 @@ class NullAdversary:
         return self.model(x)
 
 class NormalizationWrapper(nn.Module):
-    def __init__(self, model):
+    def __init__(self, model, mean, std):
         super(NormalizationWrapper, self).__init__()
         self.model = model
-    
+        self.mean = mean
+        self.std = std
+        print(mean, std)
     def forward(self, x):
-        x = utils.normalize_image_tensor(x)
+        x = utils.normalize_image_tensor(x, self.mean, self.std)
         return self.model(x)
 
 class EnsembleWrapper(nn.Module):
@@ -61,9 +66,14 @@ class GaussianSmoothingWrapper(nn.Module):
         self.model = model
         self.sigma = sigma
         self.concensus_pc = concensus_pc
-    def _forward(self, x):
+
+    def perturb(self, x):
         eps = torch.normal(mean=0, std=self.sigma,size=x.shape).to(x.device)
         x += eps
+        return x
+        
+    def _forward(self, x):
+        x = self.perturb(x)
         return self.model(x)
 
     def forward(self, x, n_samples=1):
@@ -134,10 +144,8 @@ class Attacker:
         
         return accuracy.item(), confusion_matrix
 
-def extract_attack(args):
-    if args.binary_classification:
-        loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(9), reduction='sum')
-    else:
+def extract_attack(args, loss_fn=None):
+    if loss_fn is None:
         loss_fn = nn.CrossEntropyLoss(reduction='sum')
     if args.attack =="fgsm":
         attack_class = FGSM
@@ -145,11 +153,11 @@ def extract_attack(args):
         print("Using FGSM attack with eps=%f"%args.eps)
     elif args.attack =="pgdinf":
         attack_class = LinfPGDAttack
-        attack_kwargs = {"loss_fn":loss_fn,"eps":args.eps,"nb_iter":args.nb_iter,"eps_iter":args.eps_iter}
+        attack_kwargs = {"loss_fn":loss_fn,"eps":args.eps,"nb_iter":args.nb_iter,"eps_iter":args.eps_iter, 'accumulate_param_grad_prob':args.accumulate_adv_grad_prob}
         print("Using PGD attack with %d iterations of step %f on Linf ball of radius=%f"%(args.nb_iter,args.eps_iter,args.eps))
     elif args.attack =="pgdl2":
         attack_class = L2PGDAttack
-        attack_kwargs = {"loss_fn":loss_fn,"eps":args.eps,"nb_iter":args.nb_iter,"eps_iter":args.eps_iter}
+        attack_kwargs = {"loss_fn":loss_fn,"eps":args.eps,"nb_iter":args.nb_iter,"eps_iter":args.eps_iter, 'accumulate_param_grad_prob':args.accumulate_adv_grad_prob}
         print("Using PGD attack with %d iterations of step %f on L2 ball of radius=%f"%(args.nb_iter,args.eps_iter,args.eps))
     elif args.attack =="cwl2":
         attack_class = CarliniWagnerL2Attack
@@ -171,12 +179,19 @@ def whitebox_attack(model, args):
     # if os.path.exists(outfile):
     #     return
         
-    print("Using a white box attack")       
-    test_loader = get_test_loader(args.dataset, batch_size=args.batch_size)   
+    print("Using a white box attack")
+    if args.use_train_data:
+        train_dataset, val_dataset, test_dataset, nclasses = get_cifar10_dataset(args.datafolder, [torchvision.transforms.ToTensor()]*2)
+        rand_idx = np.arange(len(train_dataset))[:10000]
+        train_dataset = Subset(train_dataset, rand_idx)
+        print(len(train_dataset))
+        test_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False)
+    else:
+        test_loader = get_test_loader(args.dataset, batch_size=args.batch_size)
     print("Model configuration")
     
     attack_class,attack_kwargs = extract_attack(args)
-    prefix = "%s-%f" % (args.attack, args.eps)
+    prefix = "%s-%f" % (args.attack, args.conf if args.attack =="cwl2" else args.eps)
     # attacker = Attacker(model,test_loader, attack_class=attack_class, max_instances=args.max_instances, 
     #                     clip_min=0., clip_max=1., targeted=False, binary_classification=args.binary_classification, 
     #                     **attack_kwargs)
@@ -195,11 +210,14 @@ def whitebox_attack(model, args):
     print(prefix, 'robust accuracy:',get_accuracy(advpred, label))
     detection_TPR = (advpred == label.max() + 1).float().mean()
     detection_FPR = (pred == label.max() + 1).float().mean()
-    print(prefix, 'attack success rate:', 1 - ((advpred == label) | (advpred == label.max() + 1)).float().mean())
+    print(prefix, 'attack success rate:', ((pred == label) & (advpred != label)).float().mean())
     print(prefix, 'attack detection TPR:', detection_TPR)
     print(prefix, 'attack detection FPR:', detection_FPR)
 
-    outfile = args.model_path + 'advdata_%s_eps=%f_%drestarts.pt' % (args.attack, args.eps, args.nb_restarts)
+    outfile = args.model_path + 'advdata_%s_eps=%f_%drestarts' % (args.attack, args.conf if args.attack =="cwl2" else args.eps, args.nb_restarts)
+    if args.use_train_data:
+        outfile += '_trainset'
+    outfile += '.pt'
     torch.save({
         'args': dict(vars(args)),
         'data': adv,
@@ -267,12 +285,14 @@ if __name__ == '__main__':
     parser.add_argument('--use_gs_wrapper', action='store_true')
     parser.add_argument('--gs_sigma', type=float, default=0.12)
     parser.add_argument('--no_normalize', action='store_true')
+    parser.add_argument('--use_train_data', action='store_true')
+    parser.add_argument('--accumulate_adv_grad_prob', type=float, default=0.)
 
     args = parser.parse_args()
     
     model = torch.load(args.model_path)    
     if not args.no_normalize:
-        model = NormalizationWrapper(model)
+        model = NormalizationWrapper(model, **(utils.dataset_stats[args.dataset]))
     if args.use_gs_wrapper:
         model = GaussianSmoothingWrapper(model, args.gs_sigma)
     model.eval()
