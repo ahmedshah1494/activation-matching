@@ -184,13 +184,17 @@ if __name__ == '__main__':
     parser.add_argument('--detach_adv_logits', action='store_true')
     parser.add_argument('--layer_idxs', type=int, nargs='+', default=[])
     parser.add_argument('--include_logits', action='store_true')
-    parser.add_argument('--z_criterion', type=str, default='diff')
+    parser.add_argument('--z_criterion', type=str, default='diff', choices=('diff', 'diff-spread', 'cosine', 'cosine-spread'))
     parser.add_argument('--use_preactivation', action='store_true')
 
     parser.add_argument('--match_logits', action='store_true')
     parser.add_argument('--logit_matching_fn', type=str, choices=('KL', 'cosine', 'L2'), default='KL')
     parser.add_argument('--logit_loss_wt', type=float, default=1)
     parser.add_argument('--normalize_activations', action='store_true')
+
+    parser.add_argument('--layer_weighting', type=str, choices=('const', 'linear', 'exp'), default='const')
+    parser.add_argument('--min_layer_wt', type=float, default=0.1)
+    parser.add_argument('--max_layer_wt', type=float, default=1.)
 
     parser.add_argument('--random_seed', type=int, default=9999)
 
