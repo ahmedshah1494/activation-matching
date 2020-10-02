@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torch.nn.init as init
 from torch.utils.data import TensorDataset, DataLoader, Dataset
 from wide_resnet import Wide_ResNet
 from advertorch.utils import batch_per_image_standardization
@@ -126,14 +127,7 @@ class LayeredModel(nn.Module):
             x = utils.normalize_image_tensor(x, **(utils.dataset_stats[self.args.dataset]))
         z = x
         for i,l in enumerate(self.layers):
-            _z = l(z)
-            if hasattr(self.args, 'normalize_activations') and self.args.normalize_activations:
-                z_shape = _z.shape
-                _z = _z.view(z_shape[0], -1)
-                z_normed = _z/torch.norm(_z, p=2, dim=1, keepdim=True)
-                z = z_normed.view(*z_shape)
-            else:
-                z = _z
+            z = l(z)            
             if store_intermediate:
                 if hasattr(self.args, 'layer_idxs') and (i in self.args.layer_idxs or len(self.args.layer_idxs)==0):                    
                     Z.append(z)
@@ -314,35 +308,112 @@ class VGG16(LayeredModel):
             module.append(ActivationNormalization())
         return nn.Sequential(*module)
 
+def conv3x3(in_planes, out_planes, stride=1):
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=1, padding=1, bias=True)
+
+def conv_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        init.xavier_uniform_(m.weight, gain=np.sqrt(2))
+        init.constant_(m.bias, 0)
+    elif classname.find('BatchNorm') != -1:
+        init.constant_(m.weight, 1)
+        init.constant_(m.bias, 0)
+
+def bn_act(in_channels):
+    return nn.Sequential(
+        nn.BatchNorm2d(in_channels),
+        nn.ReLU()
+    )
+
+def conv_bn_act(args, in_channels, out_channels, kernel_size, padding, stride):
+    if hasattr(args, 'use_preactivation') and args.use_preactivation:
+        module = [
+            bn_act(in_channels),
+            nn.Conv2d(in_channels,out_channels, kernel_size=kernel_size, padding=padding, stride=stride),                
+        ]
+    else:
+        module = [
+            nn.Conv2d(in_channels,out_channels, kernel_size=kernel_size, padding=padding, stride=stride),
+            bn_act(out_channels)
+        ]
+    if args.normalize_activations:
+        module.append(ActivationNormalization())
+    return nn.Sequential(*module)
+
+class wide_basic(nn.Module):
+    def __init__(self, args, in_planes, planes, dropout_rate, stride=1):
+        super(wide_basic, self).__init__()
+        self.conv1 = conv_bn_act(args, in_planes, planes, 3, 1, 1)
+        self.dropout = nn.Dropout(p=dropout_rate)        
+        self.conv2 = conv_bn_act(args, planes, planes, 3, 1, stride)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes:
+            self.shortcut = nn.Sequential(
+                conv_bn_act(args, in_planes, planes, 1, 0, stride),
+            )
+        self.normalize = ActivationNormalization() if args.normalize_activations else nn.Sequential()
+    def forward(self, x):
+        out = self.conv2(self.dropout(self.conv1(x)))        
+        return self.normalize(out + self.shortcut(x))
+
 class WideResnet(LayeredModel):
     def __init__(self, args, depth, widen_factor, dropout_rate, num_classes):
         super(WideResnet, self).__init__(args)
         self.name = 'WideResNet_%d_%d' % (depth, widen_factor)
-        self.model = Wide_ResNet(depth, widen_factor, dropout_rate, num_classes)
-        self.layers = [
-            self.model.conv1,
-            self.model.layer1,
-            self.model.layer2,            
-            nn.Sequential(
-                self.model.layer3,
-                self.model.bn1,
-                nn.ReLU(),
+        self.in_planes = 16
+
+        assert ((depth-4)%6 ==0), 'Wide-resnet depth should be 6n+4'
+        n = (depth-4)/6
+        k = widen_factor
+
+        print('| Wide-Resnet %dx%d' %(depth, k))
+        nStages = [16, 16*k, 32*k, 64*k]
+        
+        if args.normalize_activations and not args.use_preactivation:
+            conv1 = conv_bn_act(args, 3, nStages[0], 3, 1, 1)            
+        else:
+            conv1 = nn.Conv2d(3, nStages[0], kernel_size=3, stride=1, padding=1, bias=True)
+        layer1 = self._wide_layer(wide_basic, nStages[1], n, dropout_rate, stride=1)
+        layer2 = self._wide_layer(wide_basic, nStages[2], n, dropout_rate, stride=2)
+        layer3 = self._wide_layer(wide_basic, nStages[3], n, dropout_rate, stride=2)
+        bn1 = nn.BatchNorm2d(nStages[3], momentum=0.9)
+        linear = nn.Linear(nStages[3], num_classes)
+
+        self.layers = nn.Sequential(
+            conv1,
+            *layer1,
+            *layer2,
+            *layer3,
+            nn.Sequential(                
+                bn_act(nStages[3]) if not args.use_preactivation else nn.Sequential(),
                 nn.AdaptiveAvgPool2d((1,1)),
                 Flatten(),
+                ActivationNormalization() if args.normalize_activations and not args.use_preactivation else nn.Sequential()
             ),
-            self.model.linear,
-        ]
-        self.layer_output_sizes = [16, 16*widen_factor, 32*widen_factor, 64*widen_factor, num_classes]
-    
-    def get_layer_output_sizes(self):
-        return self.layer_output_sizes
+            linear            
+        )
+
+        self.layer_output_sizes = nStages
+
+    def _wide_layer(self, block, planes, num_blocks, dropout_rate, stride):
+        strides = [stride] + [1]*(int(num_blocks)-1)
+        layers = []
+
+        for stride in strides:
+            layers.append(block(self.args, self.in_planes, planes, dropout_rate, stride))
+            self.in_planes = planes
+
+        return layers
 
     def forward(self, x, store_intermediate=False):
         return super().forward(x, store_intermediate=store_intermediate)
 
 if __name__ == '__main__':
-    model = VGG16(10).cuda()
-    x = torch.rand(128, 3, 32, 32).cuda()
-    logits, residuals = model(x)
-    for r in residuals:
-        print(r.shape, torch.norm(r, dim=0).mean())
+    net=WideResnet(28, 10, 0.3, 10).cuda()
+    print(net)
+    y, z = net(torch.randn(1,3,32,32).cuda(), store_intermediate=True)
+
+    print(y.size())
+    print([zz.shape for zz in z])
