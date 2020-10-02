@@ -5,7 +5,10 @@ import time
 import sys
 
 def get_cmdline(args):
-    if args.attack == 'pgdl2' or args.attack == 'cwl2':
+    norm = 'none'
+    eps = eps_step = [0]*10
+    conf = [0]*10
+    if args.attack == 'pgdl2':
         norm = 'L2'
         if args.dataset == 'cifar10':
             eps = [0.5, 1.0, 2.0] 
@@ -26,21 +29,24 @@ def get_cmdline(args):
         else:
             raise NotImplementedError
         eps_step = [x/4 for x in eps]
+    if args.attack == 'cwl2':
+        if args.dataset == 'cifar10':
+            conf = [0, 10]
+        else:
+            raise NotImplementedError
     elif args.attack == 'jsma':
         if args.dataset == 'cifar10':
             eps = [x/255 for x in [127, 255]]
         else:
             raise NotImplementedError
         eps_step = [x/4 for x in eps]
-    else:
-        norm = 'none'
-        eps = eps_step = [0]    
+    
     cmdlines = []
-    for i in range(len(eps)):
+    for i in range(min(len(eps), len(conf))):
         cmds = [
-            "python evaluate_on_pgd_attacks.py --model_path %s --eps %f --eps_iter %f --norm %s --nb_restart %d" % (args.model_path, eps[i], eps_step[i], norm, args.nb_restarts),
-            "python attack_classifier.py %s --dataset %s --attack %s --eps %f --eps_iter %f --nb_iter 100 --nb_restart %d --batch_size %d" % (args.model_path, args.dataset, args.attack, eps[i], eps_step[i], args.nb_restarts, args.batch_size),
-            "python attack_classifier_art.py %s --dataset %s --attack %s --eps %f --eps_iter %f --nb_iter 100 --nb_restart %d" % (args.model_path, args.dataset, args.attack, eps[i], eps_step[i], args.nb_restarts)
+            "python evaluate_on_pgd_attacks.py --model_path %s --eps %f --eps_iter %f --norm %s --nb_restart %d --conf %f" % (args.model_path, eps[i], eps_step[i], norm, args.nb_restarts, conf[i]),
+            "python attack_classifier.py %s --dataset %s --attack %s --eps %f --eps_iter %f --nb_iter %d --nb_restart %d --batch_size %d --conf %f" % (args.model_path, args.dataset, args.attack, eps[i], eps_step[i], args.nb_iters, args.nb_restarts, args.batch_size, conf[i]),
+            "python attack_classifier_art.py %s --dataset %s --attack %s --eps %f --eps_iter %f --nb_iter %d --nb_restart %d --conf %f" % (args.model_path, args.dataset, args.attack, eps[i], eps_step[i], args.nb_iters, args.nb_restarts, conf[i])
         ]
         # if args.nb_restarts > 1:
         # cmd = "CUDA_VISIBLE_DEVICES='%s'  python evaluate_on_pgd_attacks.py --model_path %s --eps %f --eps_iter %f --norm %s --nb_restart %d" % (os.environ['CUDA_VISIBLE_DEVICES'], args.model_path, eps[i], eps_step[i], norm, args.nb_restarts)
@@ -52,6 +58,8 @@ def get_cmdline(args):
             cmd += ' --binary_classification'   
         if args.dataset == 'mnist' or args.no_normalization:
             cmd += ' --no_normalize'
+        if args.use_train_data:
+            cmd += ' --use_train_data'
         cmdlines.append(cmd)
     return cmdlines
 
@@ -62,9 +70,11 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', choices=('cifar10', 'mnist'))
     parser.add_argument('--nb_restarts', default=1, type=int)
     parser.add_argument('--batch_size', default=128, type=int)
+    parser.add_argument('--nb_iters', default=100, type=int)
     parser.add_argument('--attack_library', default=1, type=int)
     parser.add_argument('--binary', action='store_true')
     parser.add_argument('--no_normalization', action='store_true')
+    parser.add_argument('--use_train_data', action='store_true')
     args = parser.parse_args()
 
     model_paths = args.model_path
